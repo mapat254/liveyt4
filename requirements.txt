@@ -1,0 +1,14 @@
+streamlit
+ffmpeg
+opencv-python-headless
+pillow
+numpy
+ffmpeg-python
+pytube
+pandas
+psutil
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+google-api-python-client
+requests
