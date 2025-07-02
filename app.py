@@ -46,10 +46,10 @@ def load_persistent_streams():
                 return pd.DataFrame(data)
         except:
             return pd.DataFrame(columns=[
-                'Video', 'Durasi', 'Jam Mulai', 'Streaming Key', 'Status', 'Is Shorts', 'Quality', 'Broadcast ID', 'Watch URL'
+                'Video', 'Durasi', 'Jam Mulai', 'Streaming Key', 'Status', 'Is Shorts', 'Quality'
             ])
     return pd.DataFrame(columns=[
-        'Video', 'Durasi', 'Jam Mulai', 'Streaming Key', 'Status', 'Is Shorts', 'Quality', 'Broadcast ID', 'Watch URL'
+        'Video', 'Durasi', 'Jam Mulai', 'Streaming Key', 'Status', 'Is Shorts', 'Quality'
     ])
 
 def save_persistent_streams(streams_df):
@@ -228,55 +228,116 @@ def get_youtube_service():
             return None
     return None
 
-def create_youtube_broadcast(title, description, start_time, privacy_status='unlisted', quality='720p'):
-    """Create a YouTube Live broadcast with proper resolution settings"""
+def get_youtube_categories():
+    """Get YouTube video categories"""
+    service = get_youtube_service()
+    if not service:
+        return {}
+    
+    try:
+        response = service.videoCategories().list(
+            part='snippet',
+            regionCode='US'  # You can change this to your region
+        ).execute()
+        
+        categories = {}
+        for item in response['items']:
+            categories[item['snippet']['title']] = item['id']
+        
+        return categories
+    except Exception as e:
+        st.error(f"Error getting categories: {e}")
+        return {}
+
+def create_youtube_broadcast(title, description, start_time, privacy_status='unlisted', 
+                           quality='720p', category_id='20', tags=None, language='en',
+                           enable_auto_start=False, enable_auto_stop=False, 
+                           enable_dvr=True, enable_content_encryption=False,
+                           enable_embed=True, enable_monitor_stream=True,
+                           projection='rectangular', latency_preference='normal'):
+    """Create a comprehensive YouTube Live broadcast with all dashboard features"""
     service = get_youtube_service()
     if not service:
         return None, None
     
     try:
-        # Create broadcast
-        broadcast_response = service.liveBroadcasts().insert(
-            part='snippet,status',
-            body={
-                'snippet': {
-                    'title': title,
-                    'description': description,
-                    'scheduledStartTime': start_time.isoformat() + 'Z'
-                },
-                'status': {
-                    'privacyStatus': privacy_status,
-                    'selfDeclaredMadeForKids': False
-                }
-            }
-        ).execute()
-        
-        broadcast_id = broadcast_response['id']
-        
-        # Map quality to YouTube resolution format
+        # Map quality to YouTube resolution
         resolution_map = {
             '480p': '480p',
             '720p': '720p', 
             '1080p': '1080p'
         }
-        
-        # Get resolution for the quality
         resolution = resolution_map.get(quality, '720p')
         
-        # Create stream with proper resolution
-        stream_response = service.liveStreams().insert(
-            part='snippet,cdn',
-            body={
-                'snippet': {
-                    'title': f'Stream for {title}'
-                },
-                'cdn': {
-                    'format': '1080p',  # YouTube accepts: 240p, 360p, 480p, 720p, 1080p, 1440p, 2160p
-                    'ingestionType': 'rtmp',
-                    'resolution': resolution,  # This is the required field
-                    'frameRate': '30fps'  # Options: 30fps, 60fps
+        # Prepare tags
+        if tags is None:
+            tags = []
+        elif isinstance(tags, str):
+            tags = [tag.strip() for tag in tags.split(',') if tag.strip()]
+        
+        # Create broadcast with comprehensive settings
+        broadcast_body = {
+            'snippet': {
+                'title': title,
+                'description': description,
+                'scheduledStartTime': start_time.isoformat() + 'Z',
+                'categoryId': str(category_id),
+                'defaultLanguage': language,
+                'defaultAudioLanguage': language
+            },
+            'status': {
+                'privacyStatus': privacy_status,
+                'selfDeclaredMadeForKids': False,
+                'madeForKids': False
+            },
+            'contentDetails': {
+                'enableAutoStart': enable_auto_start,
+                'enableAutoStop': enable_auto_stop,
+                'enableDvr': enable_dvr,
+                'enableContentEncryption': enable_content_encryption,
+                'startWithSlate': False,
+                'projection': projection,
+                'latencyPreference': latency_preference,
+                'enableClosedCaptions': True,
+                'closedCaptionsType': 'closedCaptionsDisabled',
+                'enableLowLatency': latency_preference == 'low',
+                'enableEmbed': enable_embed,
+                'recordFromStart': True,
+                'monitorStream': {
+                    'enableMonitorStream': enable_monitor_stream,
+                    'broadcastStreamDelayMs': 0
                 }
             }
+        }
+        
+        # Add tags if provided
+        if tags:
+            broadcast_body['snippet']['tags'] = tags[:500]  # YouTube limit
+        
+        broadcast_response = service.liveBroadcasts().insert(
+            part='snippet,status,contentDetails',
+            body=broadcast_body
+        ).execute()
+        
+        broadcast_id = broadcast_response['id']
+        
+        # Create stream with comprehensive settings
+        stream_body = {
+            'snippet': {
+                'title': f'Stream for {title}',
+                'description': f'Live stream for broadcast: {title}'
+            },
+            'cdn': {
+                'format': '1080p',  # YouTube format
+                'ingestionType': 'rtmp',
+                'resolution': resolution,  # Required: 480p/720p/1080p
+                'frameRate': '30fps'  # Required: 30fps/60fps
+            }
+        }
+        
+        stream_response = service.liveStreams().insert(
+            part='snippet,cdn',
+            body=stream_body
         ).execute()
         
         stream_id = stream_response['id']
@@ -290,40 +351,31 @@ def create_youtube_broadcast(title, description, start_time, privacy_status='unl
         ).execute()
         
         watch_url = f"https://www.youtube.com/watch?v={broadcast_id}"
+        studio_url = f"https://studio.youtube.com/video/{broadcast_id}/livestreaming"
         
         return {
             'broadcast_id': broadcast_id,
             'stream_id': stream_id,
             'stream_key': stream_key,
             'watch_url': watch_url,
-            'title': title
+            'studio_url': studio_url,
+            'title': title,
+            'quality': quality,
+            'privacy_status': privacy_status,
+            'category_id': category_id,
+            'tags': tags,
+            'language': language,
+            'scheduled_start': start_time.isoformat(),
+            'settings': {
+                'auto_start': enable_auto_start,
+                'auto_stop': enable_auto_stop,
+                'dvr': enable_dvr,
+                'embed': enable_embed,
+                'latency': latency_preference,
+                'projection': projection
+            }
         }, None
         
-    except Exception as e:
-        return None, str(e)
-
-def create_quick_broadcast(video_name, quality='720p'):
-    """Create a quick broadcast for immediate streaming"""
-    if not st.session_state.youtube_authenticated:
-        return None, "YouTube API not connected"
-    
-    try:
-        # Generate title based on video name and current time
-        base_name = os.path.splitext(video_name)[0]
-        current_time = datetime.datetime.now()
-        title = f"Live: {base_name} - {current_time.strftime('%d/%m/%Y %H:%M')}"
-        description = f"Live streaming {base_name} via automated scheduler"
-        
-        # Set start time to now
-        start_time = current_time + datetime.timedelta(minutes=1)  # Start in 1 minute
-        
-        broadcast_info, error = create_youtube_broadcast(title, description, start_time, 'unlisted', quality)
-        
-        if broadcast_info:
-            return broadcast_info, None
-        else:
-            return None, error
-            
     except Exception as e:
         return None, str(e)
 
@@ -623,7 +675,7 @@ def run_ffmpeg(video_path, stream_key, is_shorts, row_id, quality="720p"):
         
         cleanup_stream_files(row_id)
 
-def start_stream(video_path, stream_key, is_shorts, row_id, quality="720p", broadcast_id=None):
+def start_stream(video_path, stream_key, is_shorts, row_id, quality="720p"):
     """Start a stream in a separate process"""
     try:
         st.session_state.streams.loc[row_id, 'Status'] = 'Sedang Live'
@@ -631,12 +683,6 @@ def start_stream(video_path, stream_key, is_shorts, row_id, quality="720p", broa
         
         with open(f"stream_{row_id}.status", "w") as f:
             f.write("starting")
-        
-        # Start YouTube broadcast if broadcast_id is provided
-        if broadcast_id and st.session_state.youtube_authenticated:
-            success, message = start_youtube_broadcast(broadcast_id)
-            if not success:
-                st.warning(f"Could not start YouTube broadcast: {message}")
         
         thread = threading.Thread(
             target=run_ffmpeg,
@@ -654,14 +700,6 @@ def stop_stream(row_id):
     """Stop a running stream"""
     try:
         active_streams = load_active_streams()
-        
-        # Stop YouTube broadcast if broadcast_id exists
-        if row_id < len(st.session_state.streams):
-            broadcast_id = st.session_state.streams.loc[row_id, 'Broadcast ID']
-            if pd.notna(broadcast_id) and broadcast_id and st.session_state.youtube_authenticated:
-                success, message = stop_youtube_broadcast(broadcast_id)
-                if not success:
-                    st.warning(f"Could not stop YouTube broadcast: {message}")
         
         pid = None
         if str(row_id) in active_streams:
@@ -768,8 +806,7 @@ def check_scheduled_streams():
     for idx, row in st.session_state.streams.iterrows():
         if row['Status'] == 'Menunggu' and row['Jam Mulai'] == current_time:
             quality = row.get('Quality', '720p')
-            broadcast_id = row.get('Broadcast ID', None)
-            start_stream(row['Video'], row['Streaming Key'], row.get('Is Shorts', False), idx, quality, broadcast_id)
+            start_stream(row['Video'], row['Streaming Key'], row.get('Is Shorts', False), idx, quality)
 
 def get_stream_logs(row_id, max_lines=100):
     """Get logs for a specific stream"""
@@ -900,8 +937,7 @@ def main():
                 if row['Status'] == 'Menunggu':
                     if cols[6].button("▶️ Start", key=f"start_{i}"):
                         quality = row.get('Quality', '720p')
-                        broadcast_id = row.get('Broadcast ID', None)
-                        if start_stream(row['Video'], row['Streaming Key'], row.get('Is Shorts', False), i, quality, broadcast_id):
+                        if start_stream(row['Video'], row['Streaming Key'], row.get('Is Shorts', False), i, quality):
                             st.rerun()
                 
                 elif row['Status'] == 'Sedang Live':
@@ -917,11 +953,6 @@ def main():
                         if os.path.exists(log_file):
                             os.remove(log_file)
                         st.rerun()
-                
-                # Show YouTube link if available
-                watch_url = row.get('Watch URL', '')
-                if watch_url:
-                    cols[6].markdown(f"[🔗 YouTube]({watch_url})")
         else:
             st.info("No streams added yet. Use the 'Add New Stream' tab to add a stream.")
     
@@ -949,21 +980,9 @@ def main():
                 video_path = None
         
         with col2:
-            # YouTube API Integration for Stream Key
-            if st.session_state.youtube_authenticated:
-                st.success("🎯 YouTube API Connected - Auto Stream Key Available!")
-                
-                use_auto_stream = st.checkbox("🚀 Auto-create YouTube Live Broadcast", value=True)
-                
-                if use_auto_stream:
-                    st.info("✅ Stream key akan dibuat otomatis dari YouTube API")
-                    stream_key = None  # Will be generated automatically
-                else:
-                    stream_key = st.text_input("Manual Stream Key", type="password")
-            else:
-                st.warning("⚠️ YouTube API not connected - Manual stream key required")
-                use_auto_stream = False
-                stream_key = st.text_input("Stream Key", type="password")
+            # Manual stream key input
+            manual_stream_key = st.text_input("Manual Stream Key (optional)", type="password", 
+                                            help="Enter stream key manually or use auto-create below")
             
             now = datetime.datetime.now()
             start_time = st.time_input("Start Time", value=now)
@@ -974,55 +993,88 @@ def main():
             quality = st.selectbox("Quality", ["480p", "720p", "1080p"], index=1)
             
             is_shorts = st.checkbox("Mode Shorts (Vertical)")
+            
+            # Auto-create YouTube broadcast option
+            auto_create_broadcast = st.checkbox("🔴 Auto-create YouTube Live Broadcast", 
+                                              disabled=not st.session_state.youtube_authenticated,
+                                              help="Automatically create YouTube Live broadcast and get stream key")
+            
+            if auto_create_broadcast and not st.session_state.youtube_authenticated:
+                st.warning("⚠️ Connect YouTube API first to use auto-create feature")
+        
+        # Initialize session state for broadcast info
+        if 'last_broadcast_info' not in st.session_state:
+            st.session_state.last_broadcast_info = None
         
         if st.button("➕ Add Stream"):
             if video_path:
-                video_filename = os.path.basename(video_path)
+                stream_key = None
                 
                 # Auto-create YouTube broadcast if enabled
-                if use_auto_stream and st.session_state.youtube_authenticated:
-                    with st.spinner("🔄 Creating YouTube Live broadcast..."):
-                        broadcast_info, error = create_quick_broadcast(video_filename, quality)
+                if auto_create_broadcast and st.session_state.youtube_authenticated:
+                    with st.spinner("Creating YouTube Live broadcast..."):
+                        broadcast_title = f"Live Stream - {os.path.basename(video_path)}"
+                        broadcast_description = f"Automated live stream started at {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}"
+                        
+                        # Combine date and time for broadcast
+                        start_datetime = datetime.datetime.combine(datetime.date.today(), start_time)
+                        
+                        broadcast_info, error = create_youtube_broadcast(
+                            broadcast_title, 
+                            broadcast_description, 
+                            start_datetime, 
+                            'unlisted',  # Default privacy
+                            quality
+                        )
                     
                     if broadcast_info:
-                        st.success(f"✅ YouTube broadcast created: {broadcast_info['title']}")
                         stream_key = broadcast_info['stream_key']
-                        broadcast_id = broadcast_info['broadcast_id']
-                        watch_url = broadcast_info['watch_url']
+                        st.session_state.last_broadcast_info = broadcast_info
                         
-                        st.info(f"🔗 Watch URL: {watch_url}")
+                        st.success("✅ YouTube Live broadcast created successfully!")
+                        
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.info(f"**Stream Key:** `{stream_key[:8]}...`")
+                            st.info(f"**Broadcast ID:** `{broadcast_info['broadcast_id']}`")
+                        with col2:
+                            st.info(f"**Watch URL:** {broadcast_info['watch_url']}")
+                            st.markdown(f"[🔗 Open YouTube Live]({broadcast_info['watch_url']})")
                     else:
                         st.error(f"❌ Failed to create broadcast: {error}")
-                        return
-                else:
-                    if not stream_key:
-                        st.error("Please provide a streaming key or enable auto-create")
-                        return
-                    broadcast_id = None
-                    watch_url = ""
+                        if manual_stream_key:
+                            stream_key = manual_stream_key
+                            st.info("Using manual stream key instead")
+                        else:
+                            st.error("Please provide a manual stream key or fix YouTube API issue")
+                            stream_key = None
                 
-                new_stream = pd.DataFrame({
-                    'Video': [video_path],
-                    'Durasi': [duration],
-                    'Jam Mulai': [start_time_str],
-                    'Streaming Key': [stream_key],
-                    'Status': ['Menunggu'],
-                    'Is Shorts': [is_shorts],
-                    'Quality': [quality],
-                    'Broadcast ID': [broadcast_id if broadcast_id else ""],
-                    'Watch URL': [watch_url if watch_url else ""]
-                })
+                # Use manual stream key if provided and auto-create is disabled
+                elif manual_stream_key:
+                    stream_key = manual_stream_key
                 
-                st.session_state.streams = pd.concat([st.session_state.streams, new_stream], ignore_index=True)
-                save_persistent_streams(st.session_state.streams)
-                
-                if use_auto_stream and st.session_state.youtube_authenticated:
-                    st.success(f"✅ Added stream for {video_filename} with auto-generated YouTube broadcast!")
-                else:
+                # Add stream if we have a stream key
+                if stream_key:
+                    video_filename = os.path.basename(video_path)
+                    
+                    new_stream = pd.DataFrame({
+                        'Video': [video_path],
+                        'Durasi': [duration],
+                        'Jam Mulai': [start_time_str],
+                        'Streaming Key': [stream_key],
+                        'Status': ['Menunggu'],
+                        'Is Shorts': [is_shorts],
+                        'Quality': [quality]
+                    })
+                    
+                    st.session_state.streams = pd.concat([st.session_state.streams, new_stream], ignore_index=True)
+                    save_persistent_streams(st.session_state.streams)
                     st.success(f"✅ Added stream for {video_filename} with {quality} quality")
-                st.rerun()
+                    st.rerun()
+                else:
+                    st.error("❌ Please provide a stream key (manual or auto-create)")
             else:
-                st.error("Please provide a video path")
+                st.error("❌ Please select or upload a video file")
     
     with tab3:
         st.subheader("🔴 YouTube API Integration")
@@ -1073,77 +1125,215 @@ def main():
                 col4.metric("Videos", channel_info['video_count'])
             
             st.subheader("🎬 Manual Broadcast Creation")
-            st.caption("💡 Tip: Use 'Add New Stream' tab with auto-create enabled for easier workflow")
+            st.caption("Create broadcasts manually with full YouTube dashboard features")
+            
+            # Get YouTube categories
+            categories = get_youtube_categories()
+            category_options = list(categories.keys()) if categories else ["Gaming", "Entertainment", "Music"]
             
             with st.form("create_broadcast"):
-                broadcast_title = st.text_input("Broadcast Title", value="Live Stream")
-                broadcast_description = st.text_area("Description", value="Live streaming with automated scheduler")
+                # Basic Information
+                st.markdown("### 📝 Basic Information")
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    broadcast_title = st.text_input("🎬 Title *", value="Live Stream", max_chars=100)
+                    broadcast_description = st.text_area("📄 Description", 
+                                                       value="Live streaming with automated scheduler", 
+                                                       max_chars=5000, height=100)
+                
+                with col2:
+                    # Category selection
+                    selected_category = st.selectbox("📂 Category", category_options, index=0)
+                    category_id = categories.get(selected_category, "20") if categories else "20"
+                    
+                    # Tags
+                    tags_input = st.text_input("🏷️ Tags (comma separated)", 
+                                             placeholder="live, streaming, gaming, entertainment")
+                    
+                    # Language
+                    language = st.selectbox("🌐 Language", 
+                                          ["en", "id", "es", "fr", "de", "ja", "ko", "zh"], 
+                                          index=0)
+                
+                # Scheduling
+                st.markdown("### ⏰ Scheduling")
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    broadcast_date = st.date_input("📅 Date", value=datetime.date.today())
+                with col2:
+                    broadcast_time = st.time_input("🕐 Time", value=datetime.datetime.now().time())
+                with col3:
+                    broadcast_quality = st.selectbox("📺 Quality", ["480p", "720p", "1080p"], index=1)
+                
+                # Privacy & Visibility
+                st.markdown("### 🔒 Privacy & Visibility")
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    privacy_status = st.selectbox("👁️ Privacy", 
+                                                ["unlisted", "public", "private"], 
+                                                index=0,
+                                                help="unlisted: Not searchable but shareable via link")
+                    
+                    enable_embed = st.checkbox("🔗 Allow embedding", value=True,
+                                             help="Allow others to embed this stream on their websites")
+                
+                with col2:
+                    projection = st.selectbox("📐 Projection", 
+                                            ["rectangular", "360"], 
+                                            index=0,
+                                            help="360 for VR/360° videos")
+                    
+                    latency_preference = st.selectbox("⚡ Latency", 
+                                                    ["normal", "low", "ultraLow"], 
+                                                    index=0,
+                                                    help="Lower latency = less buffering but higher bandwidth")
+                
+                # Advanced Features
+                st.markdown("### ⚙️ Advanced Features")
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    enable_auto_start = st.checkbox("🚀 Auto-start when streaming begins", value=False,
+                                                   help="Automatically go live when stream starts")
+                    
+                    enable_auto_stop = st.checkbox("⏹️ Auto-stop when streaming ends", value=False,
+                                                  help="Automatically end broadcast when stream stops")
+                    
+                    enable_dvr = st.checkbox("💾 Enable DVR", value=True,
+                                           help="Allow viewers to rewind and pause")
+                
+                with col2:
+                    enable_content_encryption = st.checkbox("🔐 Content encryption", value=False,
+                                                           help="Encrypt stream content (for premium content)")
+                    
+                    enable_monitor_stream = st.checkbox("📊 Monitor stream health", value=True,
+                                                      help="Monitor stream quality and connection")
+                
+                # Submit button
+                st.markdown("---")
+                create_broadcast_btn = st.form_submit_button("🔴 Create Professional Broadcast", 
+                                                           use_container_width=True)
+            
+            if create_broadcast_btn:
+                if broadcast_title:
+                    # Combine date and time
+                    start_datetime = datetime.datetime.combine(broadcast_date, broadcast_time)
+                    
+                    # Parse tags
+                    tags = [tag.strip() for tag in tags_input.split(',') if tag.strip()] if tags_input else []
+                    
+                    with st.spinner("🚀 Creating professional YouTube Live broadcast..."):
+                        broadcast_info, error = create_youtube_broadcast(
+                            title=broadcast_title,
+                            description=broadcast_description,
+                            start_time=start_datetime,
+                            privacy_status=privacy_status,
+                            quality=broadcast_quality,
+                            category_id=category_id,
+                            tags=tags,
+                            language=language,
+                            enable_auto_start=enable_auto_start,
+                            enable_auto_stop=enable_auto_stop,
+                            enable_dvr=enable_dvr,
+                            enable_content_encryption=enable_content_encryption,
+                            enable_embed=enable_embed,
+                            enable_monitor_stream=enable_monitor_stream,
+                            projection=projection,
+                            latency_preference=latency_preference
+                        )
+                    
+                    if broadcast_info:
+                        st.success("🎉 Professional broadcast created successfully!")
+                        
+                        # Display comprehensive broadcast info
+                        st.markdown("### 📋 Broadcast Details")
+                        
+                        col1, col2, col3 = st.columns(3)
+                        
+                        with col1:
+                            st.info(f"**🎬 Title:** {broadcast_info['title']}")
+                            st.info(f"**📺 Quality:** {broadcast_info['quality']}")
+                            st.info(f"**🔒 Privacy:** {broadcast_info['privacy_status']}")
+                            st.info(f"**📂 Category ID:** {broadcast_info['category_id']}")
+                        
+                        with col2:
+                            st.info(f"**🌐 Language:** {broadcast_info['language']}")
+                            st.info(f"**⚡ Latency:** {broadcast_info['settings']['latency']}")
+                            st.info(f"**📐 Projection:** {broadcast_info['settings']['projection']}")
+                            st.info(f"**🏷️ Tags:** {len(broadcast_info.get('tags', []))} tags")
+                        
+                        with col3:
+                            st.info(f"**🚀 Auto-start:** {'✅' if broadcast_info['settings']['auto_start'] else '❌'}")
+                            st.info(f"**⏹️ Auto-stop:** {'✅' if broadcast_info['settings']['auto_stop'] else '❌'}")
+                            st.info(f"**💾 DVR:** {'✅' if broadcast_info['settings']['dvr'] else '❌'}")
+                            st.info(f"**🔗 Embed:** {'✅' if broadcast_info['settings']['embed'] else '❌'}")
+                        
+                        # Stream key and URLs
+                        st.markdown("### 🔑 Stream Information")
+                        col1, col2 = st.columns(2)
+                        
+                        with col1:
+                            st.code(f"Stream Key: {broadcast_info['stream_key']}", language="text")
+                            st.code(f"Broadcast ID: {broadcast_info['broadcast_id']}", language="text")
+                        
+                        with col2:
+                            st.markdown(f"**🔗 Watch URL:** [Open YouTube Live]({broadcast_info['watch_url']})")
+                            st.markdown(f"**🎛️ Studio URL:** [Open YouTube Studio]({broadcast_info['studio_url']})")
+                        
+                        # Tags display
+                        if broadcast_info.get('tags'):
+                            st.markdown("### 🏷️ Tags")
+                            tags_display = " • ".join([f"`{tag}`" for tag in broadcast_info['tags']])
+                            st.markdown(tags_display)
+                        
+                        st.session_state.last_broadcast_info = broadcast_info
+                    else:
+                        st.error(f"❌ Error creating broadcast: {error}")
+                        
+                        # Show detailed error help
+                        if "quota" in str(error).lower():
+                            st.warning("💡 **Quota exceeded.** Try again later or check your API quota limits.")
+                        elif "permission" in str(error).lower():
+                            st.warning("💡 **Permission denied.** Make sure your YouTube channel is verified for live streaming.")
+                        elif "resolution" in str(error).lower():
+                            st.warning("💡 **Resolution error.** Try using a different quality setting.")
+                else:
+                    st.error("❌ Please enter a broadcast title")
+            
+            # Show last created broadcast info
+            if st.session_state.get('last_broadcast_info'):
+                st.markdown("---")
+                st.subheader("📋 Last Created Broadcast")
+                info = st.session_state.last_broadcast_info
                 
                 col1, col2, col3 = st.columns(3)
                 with col1:
-                    broadcast_date = st.date_input("Date", value=datetime.date.today())
+                    st.info(f"**🎬 Title:** {info['title']}")
+                    st.info(f"**📺 Quality:** {info.get('quality', 'N/A')}")
                 with col2:
-                    broadcast_time = st.time_input("Time", value=datetime.datetime.now().time())
+                    st.info(f"**🔑 Stream Key:** `{info['stream_key'][:8]}...`")
+                    st.info(f"**🆔 Broadcast ID:** `{info['broadcast_id']}`")
                 with col3:
-                    broadcast_quality = st.selectbox("Quality", ["480p", "720p", "1080p"], index=1)
+                    st.markdown(f"**🔗 Watch:** [Open]({info['watch_url']})")
+                    st.markdown(f"**🎛️ Studio:** [Open]({info['studio_url']})")
                 
-                privacy_status = st.selectbox("Privacy", ["unlisted", "public", "private"], index=0)
-                
-                if st.form_submit_button("🔴 Create Broadcast"):
-                    if broadcast_title:
-                        # Combine date and time
-                        start_datetime = datetime.datetime.combine(broadcast_date, broadcast_time)
-                        
-                        with st.spinner("Creating YouTube Live broadcast..."):
-                            broadcast_info, error = create_youtube_broadcast(
-                                broadcast_title, 
-                                broadcast_description, 
-                                start_datetime, 
-                                privacy_status,
-                                broadcast_quality
-                            )
-                        
-                        if broadcast_info:
-                            st.success("✅ Broadcast created successfully!")
-                            
-                            col1, col2 = st.columns(2)
-                            with col1:
-                                st.info(f"**Stream Key:** `{broadcast_info['stream_key']}`")
-                                st.info(f"**Broadcast ID:** `{broadcast_info['broadcast_id']}`")
-                            with col2:
-                                st.info(f"**Watch URL:** {broadcast_info['watch_url']}")
-                                st.markdown(f"[🔗 Open YouTube Live]({broadcast_info['watch_url']})")
-                            
-                            # Auto-add to streams
-                            if st.button("➕ Add to Stream Manager"):
-                                new_stream = pd.DataFrame({
-                                    'Video': [''],  # Will be filled when video is selected
-                                    'Durasi': ['01:00:00'],
-                                    'Jam Mulai': [broadcast_time.strftime("%H:%M")],
-                                    'Streaming Key': [broadcast_info['stream_key']],
-                                    'Status': ['Menunggu'],
-                                    'Is Shorts': [False],
-                                    'Quality': [broadcast_quality],
-                                    'Broadcast ID': [broadcast_info['broadcast_id']],
-                                    'Watch URL': [broadcast_info['watch_url']]
-                                })
-                                
-                                st.session_state.streams = pd.concat([st.session_state.streams, new_stream], ignore_index=True)
-                                save_persistent_streams(st.session_state.streams)
-                                st.success("✅ Added to Stream Manager!")
-                                st.rerun()
-                        else:
-                            st.error(f"❌ Error creating broadcast: {error}")
-                    else:
-                        st.error("Please enter a broadcast title")
+                if st.button("🗑️ Clear Broadcast Info"):
+                    st.session_state.last_broadcast_info = None
+                    st.rerun()
             
             # Disconnect option
+            st.markdown("---")
             if st.button("🔌 Disconnect YouTube API"):
                 if os.path.exists(YOUTUBE_CREDENTIALS_FILE):
                     os.remove(YOUTUBE_CREDENTIALS_FILE)
                 st.session_state.youtube_authenticated = False
                 if 'youtube_credentials' in st.session_state:
                     del st.session_state.youtube_credentials
+                if 'last_broadcast_info' in st.session_state:
+                    del st.session_state.last_broadcast_info
                 st.success("✅ Disconnected from YouTube API")
                 st.rerun()
     
@@ -1190,8 +1380,7 @@ def main():
         ✅ **GOP Settings**: Keyframe interval optimal untuk YouTube  
         ✅ **Audio Quality**: AAC encoding dengan sample rate 44.1kHz  
         ✅ **YouTube API**: Automatic broadcast creation dan management  
-        ✅ **Auto Stream Key**: Otomatis generate stream key dari YouTube API  
-        ✅ **Resolution Support**: Proper resolution settings untuk YouTube  
+        ✅ **Professional Features**: Full YouTube dashboard integration  
         
         ### 📊 Quality Settings:
         
@@ -1199,22 +1388,18 @@ def main():
         - **720p**: 2500k video bitrate, 128k audio - recommended
         - **1080p**: 4500k video bitrate, 192k audio - untuk koneksi cepat
         
-        ### 🚀 New Auto Features:
+        ### 🎬 YouTube Features Supported:
         
-        **Auto YouTube Integration:**
-        - ✅ Otomatis buat YouTube Live broadcast
-        - ✅ Auto-generate stream key dengan resolution yang tepat
-        - ✅ Auto-start/stop broadcast
-        - ✅ Direct YouTube watch links
-        - ✅ No manual stream key needed!
-        - ✅ Quality-based resolution mapping
-        
-        **Workflow Baru:**
-        1. Connect YouTube API (sekali saja)
-        2. Upload video
-        3. Enable "Auto-create YouTube Live Broadcast"
-        4. Pilih quality (480p/720p/1080p)
-        5. Klik "Add Stream" - Done! 🎉
+        - **Categories**: Gaming, Entertainment, Music, dll
+        - **Tags**: SEO optimization dengan tags
+        - **Privacy**: Public, Unlisted, Private
+        - **DVR**: Rewind dan pause untuk viewers
+        - **Auto-start/stop**: Otomatis mulai/berhenti
+        - **Latency Control**: Normal, Low, Ultra-low
+        - **Embedding**: Allow/disable embedding
+        - **360° Support**: VR dan 360° video
+        - **Content Encryption**: Premium content protection
+        - **Stream Monitoring**: Real-time health monitoring
         
         ### 🔧 Troubleshooting:
         
@@ -1229,12 +1414,12 @@ def main():
         - Gunakan video dengan resolusi 9:16 untuk hasil terbaik
         
         **YouTube API Features:**
-        - Auto-create live broadcasts dengan resolution yang tepat
-        - Get stream keys automatically
-        - Start/stop broadcasts remotely
-        - Channel analytics integration
-        - Direct YouTube links
-        - Quality-based stream configuration
+        - Auto-create live broadcasts dengan semua fitur dashboard
+        - Professional broadcast settings
+        - Category dan tags optimization
+        - Advanced privacy dan embedding controls
+        - Real-time stream monitoring
+        - Auto-start/stop capabilities
         """)
         
         st.subheader("🌐 Network Test")
@@ -1247,31 +1432,29 @@ def main():
         st.markdown("""
         ### Instructions:
         
-        1. **Setup YouTube API** (Recommended):
+        1. **Setup YouTube API** (Optional):
            - Go to YouTube API tab
            - Follow setup instructions
            - Connect your YouTube channel
         
         2. **Add a Stream**: 
            - Select or upload a video
-           - ✅ **Enable "Auto-create YouTube Live Broadcast"**
+           - Enter stream key manually OR enable auto-create
            - Choose quality and settings
            - Set start time
-           - **No manual stream key needed!**
         
         3. **Manage Streams**:
            - Start/stop streams manually
            - Auto-start at scheduled time
            - View logs for monitoring
            - **Streams continue running after page refresh!**
-           - **Direct YouTube links available!**
         
         ### Requirements:
         
         - FFmpeg must be installed
         - Compatible video formats (MP4 recommended)
         - Stable internet (upload speed 3x bitrate)
-        - YouTube API credentials (recommended)
+        - YouTube API credentials (optional)
         
         ### Quality Recommendations:
         
@@ -1281,14 +1464,18 @@ def main():
         
         ### New Features:
         
-        ✅ **Auto YouTube Integration**  
-        ✅ **Auto-stream key generation**  
-        ✅ **Auto-broadcast creation**  
-        ✅ **Auto-start/stop broadcasts**  
-        ✅ **Direct YouTube watch links**  
-        ✅ **Enhanced error handling**  
-        ✅ **Simplified workflow**  
-        ✅ **Resolution-based quality mapping**  
+        ✅ **YouTube API Integration**  
+        ✅ **Professional broadcast creation**  
+        ✅ **Full dashboard features**  
+        ✅ **Categories & tags support**  
+        ✅ **Advanced privacy controls**  
+        ✅ **DVR & embedding options**  
+        ✅ **Latency optimization**  
+        ✅ **360° video support**  
+        ✅ **Content encryption**  
+        ✅ **Stream health monitoring**  
+        ✅ **Auto-start/stop**  
+        ✅ **Multi-language support**  
         """)
     
     time.sleep(1)
