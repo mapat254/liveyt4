@@ -228,8 +228,8 @@ def get_youtube_service():
             return None
     return None
 
-def create_youtube_broadcast(title, description, start_time, privacy_status='unlisted'):
-    """Create a YouTube Live broadcast"""
+def create_youtube_broadcast(title, description, start_time, privacy_status='unlisted', quality='720p'):
+    """Create a YouTube Live broadcast with proper resolution settings"""
     service = get_youtube_service()
     if not service:
         return None, None
@@ -253,7 +253,17 @@ def create_youtube_broadcast(title, description, start_time, privacy_status='unl
         
         broadcast_id = broadcast_response['id']
         
-        # Create stream
+        # Map quality to YouTube resolution format
+        resolution_map = {
+            '480p': '480p',
+            '720p': '720p', 
+            '1080p': '1080p'
+        }
+        
+        # Get resolution for the quality
+        resolution = resolution_map.get(quality, '720p')
+        
+        # Create stream with proper resolution
         stream_response = service.liveStreams().insert(
             part='snippet,cdn',
             body={
@@ -261,8 +271,10 @@ def create_youtube_broadcast(title, description, start_time, privacy_status='unl
                     'title': f'Stream for {title}'
                 },
                 'cdn': {
-                    'format': '1080p',
-                    'ingestionType': 'rtmp'
+                    'format': '1080p',  # YouTube accepts: 240p, 360p, 480p, 720p, 1080p, 1440p, 2160p
+                    'ingestionType': 'rtmp',
+                    'resolution': resolution,  # This is the required field
+                    'frameRate': '30fps'  # Options: 30fps, 60fps
                 }
             }
         ).execute()
@@ -290,7 +302,7 @@ def create_youtube_broadcast(title, description, start_time, privacy_status='unl
     except Exception as e:
         return None, str(e)
 
-def create_quick_broadcast(video_name):
+def create_quick_broadcast(video_name, quality='720p'):
     """Create a quick broadcast for immediate streaming"""
     if not st.session_state.youtube_authenticated:
         return None, "YouTube API not connected"
@@ -305,7 +317,7 @@ def create_quick_broadcast(video_name):
         # Set start time to now
         start_time = current_time + datetime.timedelta(minutes=1)  # Start in 1 minute
         
-        broadcast_info, error = create_youtube_broadcast(title, description, start_time, 'unlisted')
+        broadcast_info, error = create_youtube_broadcast(title, description, start_time, 'unlisted', quality)
         
         if broadcast_info:
             return broadcast_info, None
@@ -970,7 +982,7 @@ def main():
                 # Auto-create YouTube broadcast if enabled
                 if use_auto_stream and st.session_state.youtube_authenticated:
                     with st.spinner("🔄 Creating YouTube Live broadcast..."):
-                        broadcast_info, error = create_quick_broadcast(video_filename)
+                        broadcast_info, error = create_quick_broadcast(video_filename, quality)
                     
                     if broadcast_info:
                         st.success(f"✅ YouTube broadcast created: {broadcast_info['title']}")
@@ -1067,11 +1079,13 @@ def main():
                 broadcast_title = st.text_input("Broadcast Title", value="Live Stream")
                 broadcast_description = st.text_area("Description", value="Live streaming with automated scheduler")
                 
-                col1, col2 = st.columns(2)
+                col1, col2, col3 = st.columns(3)
                 with col1:
                     broadcast_date = st.date_input("Date", value=datetime.date.today())
                 with col2:
                     broadcast_time = st.time_input("Time", value=datetime.datetime.now().time())
+                with col3:
+                    broadcast_quality = st.selectbox("Quality", ["480p", "720p", "1080p"], index=1)
                 
                 privacy_status = st.selectbox("Privacy", ["unlisted", "public", "private"], index=0)
                 
@@ -1085,7 +1099,8 @@ def main():
                                 broadcast_title, 
                                 broadcast_description, 
                                 start_datetime, 
-                                privacy_status
+                                privacy_status,
+                                broadcast_quality
                             )
                         
                         if broadcast_info:
@@ -1108,7 +1123,7 @@ def main():
                                     'Streaming Key': [broadcast_info['stream_key']],
                                     'Status': ['Menunggu'],
                                     'Is Shorts': [False],
-                                    'Quality': ['720p'],
+                                    'Quality': [broadcast_quality],
                                     'Broadcast ID': [broadcast_info['broadcast_id']],
                                     'Watch URL': [broadcast_info['watch_url']]
                                 })
@@ -1176,6 +1191,7 @@ def main():
         ✅ **Audio Quality**: AAC encoding dengan sample rate 44.1kHz  
         ✅ **YouTube API**: Automatic broadcast creation dan management  
         ✅ **Auto Stream Key**: Otomatis generate stream key dari YouTube API  
+        ✅ **Resolution Support**: Proper resolution settings untuk YouTube  
         
         ### 📊 Quality Settings:
         
@@ -1187,16 +1203,18 @@ def main():
         
         **Auto YouTube Integration:**
         - ✅ Otomatis buat YouTube Live broadcast
-        - ✅ Auto-generate stream key
+        - ✅ Auto-generate stream key dengan resolution yang tepat
         - ✅ Auto-start/stop broadcast
         - ✅ Direct YouTube watch links
         - ✅ No manual stream key needed!
+        - ✅ Quality-based resolution mapping
         
         **Workflow Baru:**
         1. Connect YouTube API (sekali saja)
         2. Upload video
         3. Enable "Auto-create YouTube Live Broadcast"
-        4. Klik "Add Stream" - Done! 🎉
+        4. Pilih quality (480p/720p/1080p)
+        5. Klik "Add Stream" - Done! 🎉
         
         ### 🔧 Troubleshooting:
         
@@ -1211,11 +1229,12 @@ def main():
         - Gunakan video dengan resolusi 9:16 untuk hasil terbaik
         
         **YouTube API Features:**
-        - Auto-create live broadcasts
+        - Auto-create live broadcasts dengan resolution yang tepat
         - Get stream keys automatically
         - Start/stop broadcasts remotely
         - Channel analytics integration
         - Direct YouTube links
+        - Quality-based stream configuration
         """)
         
         st.subheader("🌐 Network Test")
@@ -1269,6 +1288,7 @@ def main():
         ✅ **Direct YouTube watch links**  
         ✅ **Enhanced error handling**  
         ✅ **Simplified workflow**  
+        ✅ **Resolution-based quality mapping**  
         """)
     
     time.sleep(1)
