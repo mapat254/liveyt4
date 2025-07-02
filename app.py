@@ -789,7 +789,7 @@ def setup_youtube_oauth():
            - Go to "APIs & Services" > "Credentials"
            - Click "Create Credentials" > "OAuth 2.0 Client ID"
            - Choose "Web application"
-           - Add authorized redirect URI: `http://localhost:8501`
+           - Add authorized redirect URI: `https://liveyt4.streamlit.app`
         5. **Download the JSON file** and copy Client ID & Client Secret below
         
         ### Required Scopes:
@@ -844,12 +844,12 @@ def setup_youtube_oauth():
                                 "client_secret": config['client_secret'],
                                 "auth_uri": "https://accounts.google.com/o/oauth2/auth",
                                 "token_uri": "https://oauth2.googleapis.com/token",
-                                "redirect_uris": ["http://localhost:8501"]
+                                "redirect_uris": ["https://liveyt4.streamlit.app"]
                             }
                         },
                         scopes=YOUTUBE_SCOPES
                     )
-                    flow.redirect_uri = "http://localhost:8501"
+                    flow.redirect_uri = "https://liveyt4.streamlit.app"
                     
                     # Get authorization URL
                     auth_url, _ = flow.authorization_url(prompt='consent')
