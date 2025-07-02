@@ -46,10 +46,10 @@ def load_persistent_streams():
                 return pd.DataFrame(data)
         except:
             return pd.DataFrame(columns=[
-                'Video', 'Durasi', 'Jam Mulai', 'Streaming Key', 'Status', 'Is Shorts', 'Quality'
+                'Video', 'Durasi', 'Jam Mulai', 'Streaming Key', 'Status', 'Is Shorts', 'Quality', 'Broadcast ID', 'Watch URL'
             ])
     return pd.DataFrame(columns=[
-        'Video', 'Durasi', 'Jam Mulai', 'Streaming Key', 'Status', 'Is Shorts', 'Quality'
+        'Video', 'Durasi', 'Jam Mulai', 'Streaming Key', 'Status', 'Is Shorts', 'Quality', 'Broadcast ID', 'Watch URL'
     ])
 
 def save_persistent_streams(streams_df):
@@ -124,85 +124,68 @@ def load_youtube_credentials():
     return None
 
 def handle_oauth_callback():
-    """Handle OAuth callback from URL parameters using new Streamlit API"""
-    try:
-        # Use new st.query_params instead of deprecated function
-        query_params = st.query_params
-        
-        if 'code' in query_params and 'client_id' in st.session_state and 'client_secret' in st.session_state:
-            auth_code = query_params['code']
+    """Handle OAuth callback from URL parameters"""
+    # Check if we have authorization code in URL parameters
+    query_params = st.experimental_get_query_params()
+    
+    if 'code' in query_params and 'client_id' in st.session_state and 'client_secret' in st.session_state:
+        try:
+            auth_code = query_params['code'][0]
             
-            with st.spinner("🔄 Processing authentication..."):
-                # Exchange authorization code for tokens
-                token_url = "https://oauth2.googleapis.com/token"
+            # Exchange authorization code for tokens
+            token_url = "https://oauth2.googleapis.com/token"
+            
+            data = {
+                'client_id': st.session_state.client_id,
+                'client_secret': st.session_state.client_secret,
+                'code': auth_code,
+                'grant_type': 'authorization_code',
+                'redirect_uri': 'https://liveyt4.streamlit.app'  # Your actual Streamlit app URL
+            }
+            
+            response = requests.post(token_url, data=data)
+            
+            if response.status_code == 200:
+                token_data = response.json()
                 
-                data = {
-                    'client_id': st.session_state.client_id,
-                    'client_secret': st.session_state.client_secret,
-                    'code': auth_code,
-                    'grant_type': 'authorization_code',
-                    'redirect_uri': 'https://liveyt4.streamlit.app'
-                }
+                # Create credentials object
+                credentials = Credentials(
+                    token=token_data['access_token'],
+                    refresh_token=token_data.get('refresh_token'),
+                    token_uri=token_url,
+                    client_id=st.session_state.client_id,
+                    client_secret=st.session_state.client_secret,
+                    scopes=['https://www.googleapis.com/auth/youtube.force-ssl']
+                )
                 
-                response = requests.post(token_url, data=data)
-                
-                if response.status_code == 200:
-                    token_data = response.json()
+                # Save credentials
+                if save_youtube_credentials(credentials):
+                    st.session_state.youtube_authenticated = True
+                    st.session_state.youtube_credentials = credentials
+                    st.success("✅ YouTube authentication successful!")
                     
-                    # Create credentials object
-                    credentials = Credentials(
-                        token=token_data['access_token'],
-                        refresh_token=token_data.get('refresh_token'),
-                        token_uri=token_url,
-                        client_id=st.session_state.client_id,
-                        client_secret=st.session_state.client_secret,
-                        scopes=['https://www.googleapis.com/auth/youtube.force-ssl']
-                    )
-                    
-                    # Save credentials
-                    if save_youtube_credentials(credentials):
-                        st.session_state.youtube_authenticated = True
-                        st.session_state.youtube_credentials = credentials
-                        
-                        # Clear URL parameters using new API
-                        st.query_params.clear()
-                        
-                        st.success("✅ YouTube authentication successful!")
-                        st.balloons()
-                        time.sleep(2)
-                        st.rerun()
-                    else:
-                        st.error("❌ Failed to save credentials")
+                    # Clear URL parameters
+                    st.experimental_set_query_params()
+                    st.rerun()
                 else:
-                    error_data = response.json() if response.headers.get('content-type') == 'application/json' else {}
-                    error_msg = error_data.get('error_description', response.text)
-                    st.error(f"❌ Token exchange failed: {error_msg}")
-                    
-        elif 'error' in query_params:
-            error = query_params['error']
-            st.error(f"❌ Authentication error: {error}")
-            # Clear error from URL
-            st.query_params.clear()
-            
-    except Exception as e:
-        st.error(f"❌ Error handling OAuth callback: {e}")
+                    st.error("Failed to save credentials")
+            else:
+                st.error(f"Token exchange failed: {response.text}")
+                
+        except Exception as e:
+            st.error(f"Error handling OAuth callback: {e}")
 
 def authenticate_youtube_manual():
     """Manual YouTube authentication with proper redirect URI"""
     if 'client_id' not in st.session_state or 'client_secret' not in st.session_state:
-        st.error("❌ Please enter Client ID and Client Secret first")
+        st.error("Please enter Client ID and Client Secret first")
         return
     
     try:
         # Create OAuth URL manually
         client_id = st.session_state.client_id
-        redirect_uri = "https://liveyt4.streamlit.app"
+        redirect_uri = "https://liveyt4.streamlit.app"  # Your actual Streamlit app URL
         scope = "https://www.googleapis.com/auth/youtube.force-ssl"
-        
-        # Generate state parameter for security
-        import secrets
-        state = secrets.token_urlsafe(32)
-        st.session_state.oauth_state = state
         
         auth_url = (
             f"https://accounts.google.com/o/oauth2/auth?"
@@ -211,60 +194,37 @@ def authenticate_youtube_manual():
             f"scope={urllib.parse.quote(scope)}&"
             f"response_type=code&"
             f"access_type=offline&"
-            f"prompt=consent&"
-            f"state={state}"
+            f"prompt=consent"
         )
         
         st.markdown(f"""
         ### 🔐 YouTube Authentication
         
-        **Step 1:** Click the button below to authorize the application:
-        """)
+        **Step 1:** Click the link below to authorize the application:
         
-        # Create a more prominent button
-        if st.button("🚀 **Authorize YouTube Access**", type="primary", use_container_width=True):
-            st.markdown(f"""
-            **Redirecting to Google...**
-            
-            If the page doesn't redirect automatically, [click here]({auth_url})
-            """)
-            # Use JavaScript to redirect
-            components.html(f"""
-            <script>
-                window.open('{auth_url}', '_blank');
-            </script>
-            """, height=0)
+        **[🔗 Authorize YouTube Access]({auth_url})**
         
-        st.markdown("""
         **Step 2:** After authorization, you will be redirected back to this page automatically.
         
         **Step 3:** The page will refresh and show authentication success.
         
         ---
         
-        **⚠️ Important Notes:**
-        - Make sure you're logged into the correct Google account
-        - The account must own the YouTube channel you want to stream to
-        - Grant all requested permissions for full functionality
+        **Note:** Make sure you're logged into the correct Google account that owns the YouTube channel you want to stream to.
         """)
         
     except Exception as e:
-        st.error(f"❌ Error creating authentication URL: {e}")
+        st.error(f"Error creating authentication URL: {e}")
 
 def get_youtube_service():
     """Get authenticated YouTube service"""
     credentials = load_youtube_credentials()
     if credentials:
         try:
-            # Check if credentials are valid
-            if credentials.expired and credentials.refresh_token:
-                credentials.refresh(Request())
-                save_youtube_credentials(credentials)
-            
             service = build('youtube', 'v3', credentials=credentials)
             return service
         except Exception as e:
-            st.error(f"❌ Error creating YouTube service: {e}")
+            st.error(f"Error creating YouTube service: {e}")
             return None
     return None
 
@@ -272,7 +232,7 @@ def create_youtube_broadcast(title, description, start_time, privacy_status='unl
     """Create a YouTube Live broadcast"""
     service = get_youtube_service()
     if not service:
-        return None, "YouTube service not available"
+        return None, None
     
     try:
         # Create broadcast
@@ -330,6 +290,31 @@ def create_youtube_broadcast(title, description, start_time, privacy_status='unl
     except Exception as e:
         return None, str(e)
 
+def create_quick_broadcast(video_name):
+    """Create a quick broadcast for immediate streaming"""
+    if not st.session_state.youtube_authenticated:
+        return None, "YouTube API not connected"
+    
+    try:
+        # Generate title based on video name and current time
+        base_name = os.path.splitext(video_name)[0]
+        current_time = datetime.datetime.now()
+        title = f"Live: {base_name} - {current_time.strftime('%d/%m/%Y %H:%M')}"
+        description = f"Live streaming {base_name} via automated scheduler"
+        
+        # Set start time to now
+        start_time = current_time + datetime.timedelta(minutes=1)  # Start in 1 minute
+        
+        broadcast_info, error = create_youtube_broadcast(title, description, start_time, 'unlisted')
+        
+        if broadcast_info:
+            return broadcast_info, None
+        else:
+            return None, error
+            
+    except Exception as e:
+        return None, str(e)
+
 def start_youtube_broadcast(broadcast_id):
     """Start a YouTube Live broadcast"""
     service = get_youtube_service()
@@ -383,7 +368,7 @@ def get_channel_info():
                 'video_count': channel['statistics'].get('videoCount', '0')
             }
     except Exception as e:
-        st.error(f"❌ Error getting channel info: {e}")
+        st.error(f"Error getting channel info: {e}")
     
     return None
 
@@ -391,9 +376,9 @@ def check_ffmpeg():
     """Check if ffmpeg is installed and available"""
     ffmpeg_path = shutil.which('ffmpeg')
     if not ffmpeg_path:
-        st.error("❌ FFmpeg is not installed or not in PATH. Please install FFmpeg to use this application.")
+        st.error("FFmpeg is not installed or not in PATH. Please install FFmpeg to use this application.")
         st.markdown("""
-        ### 📥 How to install FFmpeg:
+        ### How to install FFmpeg:
         
         - **Ubuntu/Debian**: `sudo apt-get install ffmpeg`
         - **Windows**: Download from [ffmpeg.org](https://ffmpeg.org/download.html) and add to PATH
@@ -626,7 +611,7 @@ def run_ffmpeg(video_path, stream_key, is_shorts, row_id, quality="720p"):
         
         cleanup_stream_files(row_id)
 
-def start_stream(video_path, stream_key, is_shorts, row_id, quality="720p"):
+def start_stream(video_path, stream_key, is_shorts, row_id, quality="720p", broadcast_id=None):
     """Start a stream in a separate process"""
     try:
         st.session_state.streams.loc[row_id, 'Status'] = 'Sedang Live'
@@ -634,6 +619,12 @@ def start_stream(video_path, stream_key, is_shorts, row_id, quality="720p"):
         
         with open(f"stream_{row_id}.status", "w") as f:
             f.write("starting")
+        
+        # Start YouTube broadcast if broadcast_id is provided
+        if broadcast_id and st.session_state.youtube_authenticated:
+            success, message = start_youtube_broadcast(broadcast_id)
+            if not success:
+                st.warning(f"Could not start YouTube broadcast: {message}")
         
         thread = threading.Thread(
             target=run_ffmpeg,
@@ -644,13 +635,21 @@ def start_stream(video_path, stream_key, is_shorts, row_id, quality="720p"):
         
         return True
     except Exception as e:
-        st.error(f"❌ Error starting stream: {e}")
+        st.error(f"Error starting stream: {e}")
         return False
 
 def stop_stream(row_id):
     """Stop a running stream"""
     try:
         active_streams = load_active_streams()
+        
+        # Stop YouTube broadcast if broadcast_id exists
+        if row_id < len(st.session_state.streams):
+            broadcast_id = st.session_state.streams.loc[row_id, 'Broadcast ID']
+            if pd.notna(broadcast_id) and broadcast_id and st.session_state.youtube_authenticated:
+                success, message = stop_youtube_broadcast(broadcast_id)
+                if not success:
+                    st.warning(f"Could not stop YouTube broadcast: {message}")
         
         pid = None
         if str(row_id) in active_streams:
@@ -689,7 +688,7 @@ def stop_stream(row_id):
                 return True
                 
             except Exception as e:
-                st.error(f"❌ Error stopping stream: {str(e)}")
+                st.error(f"Error stopping stream: {str(e)}")
                 return False
         else:
             st.session_state.streams.loc[row_id, 'Status'] = 'Dihentikan'
@@ -703,7 +702,7 @@ def stop_stream(row_id):
             return True
             
     except Exception as e:
-        st.error(f"❌ Error stopping stream: {str(e)}")
+        st.error(f"Error stopping stream: {str(e)}")
         return False
 
 def check_stream_statuses():
@@ -757,7 +756,8 @@ def check_scheduled_streams():
     for idx, row in st.session_state.streams.iterrows():
         if row['Status'] == 'Menunggu' and row['Jam Mulai'] == current_time:
             quality = row.get('Quality', '720p')
-            start_stream(row['Video'], row['Streaming Key'], row.get('Is Shorts', False), idx, quality)
+            broadcast_id = row.get('Broadcast ID', None)
+            start_stream(row['Video'], row['Streaming Key'], row.get('Is Shorts', False), idx, quality, broadcast_id)
 
 def get_stream_logs(row_id, max_lines=100):
     """Get logs for a specific stream"""
@@ -843,33 +843,33 @@ def main():
         st.sidebar.warning("⚠️ YouTube: Not connected")
     
     # Create tabs for different sections
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Stream Manager", "➕ Add New Stream", "🔴 YouTube API", "📋 Logs", "⚙️ Settings"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["Stream Manager", "Add New Stream", "YouTube API", "Logs", "Settings"])
     
     with tab1:
-        st.subheader("📊 Manage Streams")
+        st.subheader("Manage Streams")
         
-        st.info("✅ Status akan diperbarui otomatis. Streaming akan tetap berjalan meski halaman di-refresh.")
-        st.success("🎯 Optimized untuk YouTube Live dengan pengaturan encoding terbaik")
+        st.caption("✅ Status akan diperbarui otomatis. Streaming akan tetap berjalan meski halaman di-refresh.")
+        st.caption("🎯 Optimized untuk YouTube Live dengan pengaturan encoding terbaik")
         
         if not st.session_state.streams.empty:
             header_cols = st.columns([2, 1, 1, 1, 2, 2, 2])
-            header_cols[0].write("**📹 Video**")
-            header_cols[1].write("**⏱️ Duration**")
-            header_cols[2].write("**🕐 Start Time**")
-            header_cols[3].write("**🎬 Quality**")
-            header_cols[4].write("**🔑 Streaming Key**")
-            header_cols[5].write("**📊 Status**")
-            header_cols[6].write("**🎮 Action**")
+            header_cols[0].write("**Video**")
+            header_cols[1].write("**Duration**")
+            header_cols[2].write("**Start Time**")
+            header_cols[3].write("**Quality**")
+            header_cols[4].write("**Streaming Key**")
+            header_cols[5].write("**Status**")
+            header_cols[6].write("**Action**")
             
             for i, row in st.session_state.streams.iterrows():
                 cols = st.columns([2, 1, 1, 1, 2, 2, 2])
-                cols[0].write(f"📹 {os.path.basename(row['Video'])}")
-                cols[1].write(f"⏱️ {row['Durasi']}")
-                cols[2].write(f"🕐 {row['Jam Mulai']}")
-                cols[3].write(f"🎬 {row.get('Quality', '720p')}")
+                cols[0].write(os.path.basename(row['Video']))
+                cols[1].write(row['Durasi'])
+                cols[2].write(row['Jam Mulai'])
+                cols[3].write(row.get('Quality', '720p'))
                 
                 masked_key = row['Streaming Key'][:4] + "****" if len(row['Streaming Key']) > 4 else "****"
-                cols[4].write(f"🔑 {masked_key}")
+                cols[4].write(masked_key)
                 
                 status = row['Status']
                 if status == 'Sedang Live':
@@ -886,18 +886,15 @@ def main():
                     cols[5].write(status)
                 
                 if row['Status'] == 'Menunggu':
-                    if cols[6].button("▶️ Start", key=f"start_{i}", type="primary"):
+                    if cols[6].button("▶️ Start", key=f"start_{i}"):
                         quality = row.get('Quality', '720p')
-                        if start_stream(row['Video'], row['Streaming Key'], row.get('Is Shorts', False), i, quality):
-                            st.success("🚀 Stream started!")
-                            time.sleep(1)
+                        broadcast_id = row.get('Broadcast ID', None)
+                        if start_stream(row['Video'], row['Streaming Key'], row.get('Is Shorts', False), i, quality, broadcast_id):
                             st.rerun()
                 
                 elif row['Status'] == 'Sedang Live':
-                    if cols[6].button("⏹️ Stop", key=f"stop_{i}", type="secondary"):
+                    if cols[6].button("⏹️ Stop", key=f"stop_{i}"):
                         if stop_stream(i):
-                            st.success("⏹️ Stream stopped!")
-                            time.sleep(1)
                             st.rerun()
                 
                 elif row['Status'] in ['Selesai', 'Dihentikan', 'Terputus'] or row['Status'].startswith('error:'):
@@ -907,29 +904,32 @@ def main():
                         log_file = f"stream_{i}.log"
                         if os.path.exists(log_file):
                             os.remove(log_file)
-                        st.success("🗑️ Stream removed!")
-                        time.sleep(1)
                         st.rerun()
+                
+                # Show YouTube link if available
+                watch_url = row.get('Watch URL', '')
+                if watch_url:
+                    cols[6].markdown(f"[🔗 YouTube]({watch_url})")
         else:
-            st.info("📝 No streams added yet. Use the 'Add New Stream' tab to add a stream.")
+            st.info("No streams added yet. Use the 'Add New Stream' tab to add a stream.")
     
     with tab2:
-        st.subheader("➕ Add New Stream")
+        st.subheader("Add New Stream")
         
         video_files = [f for f in os.listdir('.') if f.endswith(('.mp4', '.flv', '.avi', '.mov', '.mkv'))]
         
         col1, col2 = st.columns(2)
         
         with col1:
-            st.write("📹 **Video yang tersedia:**")
+            st.write("Video yang tersedia:")
             selected_video = st.selectbox("Pilih video", [""] + video_files) if video_files else None
             
-            uploaded_file = st.file_uploader("📤 Atau upload video baru", type=['mp4', 'flv', 'avi', 'mov', 'mkv'])
+            uploaded_file = st.file_uploader("Atau upload video baru", type=['mp4', 'flv', 'avi', 'mov', 'mkv'])
             
             if uploaded_file:
                 with open(uploaded_file.name, "wb") as f:
                     f.write(uploaded_file.getbuffer())
-                st.success("✅ Video berhasil diupload!")
+                st.success("Video berhasil diupload!")
                 video_path = uploaded_file.name
             elif selected_video:
                 video_path = selected_video
@@ -937,21 +937,57 @@ def main():
                 video_path = None
         
         with col2:
-            stream_key = st.text_input("🔑 Stream Key", type="password", help="Dapatkan dari YouTube Studio atau gunakan YouTube API")
+            # YouTube API Integration for Stream Key
+            if st.session_state.youtube_authenticated:
+                st.success("🎯 YouTube API Connected - Auto Stream Key Available!")
+                
+                use_auto_stream = st.checkbox("🚀 Auto-create YouTube Live Broadcast", value=True)
+                
+                if use_auto_stream:
+                    st.info("✅ Stream key akan dibuat otomatis dari YouTube API")
+                    stream_key = None  # Will be generated automatically
+                else:
+                    stream_key = st.text_input("Manual Stream Key", type="password")
+            else:
+                st.warning("⚠️ YouTube API not connected - Manual stream key required")
+                use_auto_stream = False
+                stream_key = st.text_input("Stream Key", type="password")
             
             now = datetime.datetime.now()
-            start_time = st.time_input("🕐 Start Time", value=now)
+            start_time = st.time_input("Start Time", value=now)
             start_time_str = start_time.strftime("%H:%M")
             
-            duration = st.text_input("⏱️ Duration (HH:MM:SS)", value="01:00:00")
+            duration = st.text_input("Duration (HH:MM:SS)", value="01:00:00")
             
-            quality = st.selectbox("🎬 Quality", ["480p", "720p", "1080p"], index=1, help="Pilih sesuai kecepatan internet")
+            quality = st.selectbox("Quality", ["480p", "720p", "1080p"], index=1)
             
-            is_shorts = st.checkbox("📱 Mode Shorts (Vertical)", help="Untuk YouTube Shorts format vertikal")
+            is_shorts = st.checkbox("Mode Shorts (Vertical)")
         
-        if st.button("➕ **Add Stream**", type="primary", use_container_width=True):
-            if video_path and stream_key:
+        if st.button("➕ Add Stream"):
+            if video_path:
                 video_filename = os.path.basename(video_path)
+                
+                # Auto-create YouTube broadcast if enabled
+                if use_auto_stream and st.session_state.youtube_authenticated:
+                    with st.spinner("🔄 Creating YouTube Live broadcast..."):
+                        broadcast_info, error = create_quick_broadcast(video_filename)
+                    
+                    if broadcast_info:
+                        st.success(f"✅ YouTube broadcast created: {broadcast_info['title']}")
+                        stream_key = broadcast_info['stream_key']
+                        broadcast_id = broadcast_info['broadcast_id']
+                        watch_url = broadcast_info['watch_url']
+                        
+                        st.info(f"🔗 Watch URL: {watch_url}")
+                    else:
+                        st.error(f"❌ Failed to create broadcast: {error}")
+                        return
+                else:
+                    if not stream_key:
+                        st.error("Please provide a streaming key or enable auto-create")
+                        return
+                    broadcast_id = None
+                    watch_url = ""
                 
                 new_stream = pd.DataFrame({
                     'Video': [video_path],
@@ -960,20 +996,21 @@ def main():
                     'Streaming Key': [stream_key],
                     'Status': ['Menunggu'],
                     'Is Shorts': [is_shorts],
-                    'Quality': [quality]
+                    'Quality': [quality],
+                    'Broadcast ID': [broadcast_id if broadcast_id else ""],
+                    'Watch URL': [watch_url if watch_url else ""]
                 })
                 
                 st.session_state.streams = pd.concat([st.session_state.streams, new_stream], ignore_index=True)
                 save_persistent_streams(st.session_state.streams)
-                st.success(f"✅ Added stream for {video_filename} with {quality} quality")
-                st.balloons()
-                time.sleep(2)
+                
+                if use_auto_stream and st.session_state.youtube_authenticated:
+                    st.success(f"✅ Added stream for {video_filename} with auto-generated YouTube broadcast!")
+                else:
+                    st.success(f"✅ Added stream for {video_filename} with {quality} quality")
                 st.rerun()
             else:
-                if not video_path:
-                    st.error("❌ Please provide a video path")
-                if not stream_key:
-                    st.error("❌ Please provide a streaming key")
+                st.error("Please provide a video path")
     
     with tab3:
         st.subheader("🔴 YouTube API Integration")
@@ -996,19 +1033,19 @@ def main():
                 
                 col1, col2 = st.columns(2)
                 with col1:
-                    client_id = st.text_input("🆔 Client ID", key="client_id_input")
+                    client_id = st.text_input("Client ID", key="client_id_input")
                 with col2:
-                    client_secret = st.text_input("🔐 Client Secret", type="password", key="client_secret_input")
+                    client_secret = st.text_input("Client Secret", type="password", key="client_secret_input")
                 
-                if st.button("💾 **Save Credentials**", type="primary"):
+                if st.button("💾 Save Credentials"):
                     if client_id and client_secret:
                         st.session_state.client_id = client_id
                         st.session_state.client_secret = client_secret
                         st.success("✅ Credentials saved! Now click 'Start Authentication' below.")
                     else:
-                        st.error("❌ Please enter both Client ID and Client Secret")
+                        st.error("Please enter both Client ID and Client Secret")
                 
-                if 'client_id' in st.session_state and 'client_secret' in st.session_state:
+                if st.button("🔐 Start Authentication"):
                     authenticate_youtube_manual()
         
         else:
@@ -1018,31 +1055,32 @@ def main():
             channel_info = get_channel_info()
             if channel_info:
                 col1, col2, col3, col4 = st.columns(4)
-                col1.metric("📺 Channel", channel_info['title'])
-                col2.metric("👥 Subscribers", channel_info['subscriber_count'])
-                col3.metric("👁️ Total Views", channel_info['view_count'])
-                col4.metric("🎬 Videos", channel_info['video_count'])
+                col1.metric("Channel", channel_info['title'])
+                col2.metric("Subscribers", channel_info['subscriber_count'])
+                col3.metric("Total Views", channel_info['view_count'])
+                col4.metric("Videos", channel_info['video_count'])
             
-            st.subheader("🎬 Create YouTube Live Broadcast")
+            st.subheader("🎬 Manual Broadcast Creation")
+            st.caption("💡 Tip: Use 'Add New Stream' tab with auto-create enabled for easier workflow")
             
             with st.form("create_broadcast"):
-                broadcast_title = st.text_input("📺 Broadcast Title", value="Live Stream")
-                broadcast_description = st.text_area("📝 Description", value="Live streaming with automated scheduler")
+                broadcast_title = st.text_input("Broadcast Title", value="Live Stream")
+                broadcast_description = st.text_area("Description", value="Live streaming with automated scheduler")
                 
                 col1, col2 = st.columns(2)
                 with col1:
-                    broadcast_date = st.date_input("📅 Date", value=datetime.date.today())
+                    broadcast_date = st.date_input("Date", value=datetime.date.today())
                 with col2:
-                    broadcast_time = st.time_input("🕐 Time", value=datetime.datetime.now().time())
+                    broadcast_time = st.time_input("Time", value=datetime.datetime.now().time())
                 
-                privacy_status = st.selectbox("🔒 Privacy", ["unlisted", "public", "private"], index=0)
+                privacy_status = st.selectbox("Privacy", ["unlisted", "public", "private"], index=0)
                 
-                if st.form_submit_button("🔴 **Create Broadcast**", type="primary"):
+                if st.form_submit_button("🔴 Create Broadcast"):
                     if broadcast_title:
                         # Combine date and time
                         start_datetime = datetime.datetime.combine(broadcast_date, broadcast_time)
                         
-                        with st.spinner("🔄 Creating YouTube Live broadcast..."):
+                        with st.spinner("Creating YouTube Live broadcast..."):
                             broadcast_info, error = create_youtube_broadcast(
                                 broadcast_title, 
                                 broadcast_description, 
@@ -1052,18 +1090,17 @@ def main():
                         
                         if broadcast_info:
                             st.success("✅ Broadcast created successfully!")
-                            st.balloons()
                             
                             col1, col2 = st.columns(2)
                             with col1:
-                                st.info(f"**🔑 Stream Key:** `{broadcast_info['stream_key']}`")
-                                st.info(f"**🆔 Broadcast ID:** `{broadcast_info['broadcast_id']}`")
+                                st.info(f"**Stream Key:** `{broadcast_info['stream_key']}`")
+                                st.info(f"**Broadcast ID:** `{broadcast_info['broadcast_id']}`")
                             with col2:
-                                st.info(f"**🔗 Watch URL:** {broadcast_info['watch_url']}")
+                                st.info(f"**Watch URL:** {broadcast_info['watch_url']}")
                                 st.markdown(f"[🔗 Open YouTube Live]({broadcast_info['watch_url']})")
                             
                             # Auto-add to streams
-                            if st.button("➕ **Add to Stream Manager**", type="primary"):
+                            if st.button("➕ Add to Stream Manager"):
                                 new_stream = pd.DataFrame({
                                     'Video': [''],  # Will be filled when video is selected
                                     'Durasi': ['01:00:00'],
@@ -1071,7 +1108,9 @@ def main():
                                     'Streaming Key': [broadcast_info['stream_key']],
                                     'Status': ['Menunggu'],
                                     'Is Shorts': [False],
-                                    'Quality': ['720p']
+                                    'Quality': ['720p'],
+                                    'Broadcast ID': [broadcast_info['broadcast_id']],
+                                    'Watch URL': [broadcast_info['watch_url']]
                                 })
                                 
                                 st.session_state.streams = pd.concat([st.session_state.streams, new_stream], ignore_index=True)
@@ -1081,10 +1120,10 @@ def main():
                         else:
                             st.error(f"❌ Error creating broadcast: {error}")
                     else:
-                        st.error("❌ Please enter a broadcast title")
+                        st.error("Please enter a broadcast title")
             
             # Disconnect option
-            if st.button("🔌 **Disconnect YouTube API**", type="secondary"):
+            if st.button("🔌 Disconnect YouTube API"):
                 if os.path.exists(YOUTUBE_CREDENTIALS_FILE):
                     os.remove(YOUTUBE_CREDENTIALS_FILE)
                 st.session_state.youtube_authenticated = False
@@ -1094,7 +1133,7 @@ def main():
                 st.rerun()
     
     with tab4:
-        st.subheader("📋 Stream Logs")
+        st.subheader("Stream Logs")
         
         log_files = [f for f in os.listdir('.') if f.startswith('stream_') and f.endswith('.log')]
         stream_ids = [int(f.split('_')[1].split('.')[0]) for f in log_files]
@@ -1104,10 +1143,10 @@ def main():
             for idx in stream_ids:
                 if idx in st.session_state.streams.index:
                     video_name = os.path.basename(st.session_state.streams.loc[idx, 'Video'])
-                    stream_options[f"📹 {video_name} (ID: {idx})"] = idx
+                    stream_options[f"{video_name} (ID: {idx})"] = idx
             
             if stream_options:
-                selected_stream = st.selectbox("📊 Select stream to view logs", options=list(stream_options.keys()))
+                selected_stream = st.selectbox("Select stream to view logs", options=list(stream_options.keys()))
                 selected_id = stream_options[selected_stream]
                 
                 logs = get_stream_logs(selected_id)
@@ -1115,26 +1154,14 @@ def main():
                 with log_container:
                     st.code("".join(logs))
                 
-                col1, col2 = st.columns(2)
-                with col1:
-                    auto_refresh = st.checkbox("🔄 Auto-refresh logs", value=False)
-                with col2:
-                    if st.button("📥 Download Logs"):
-                        log_content = "".join(logs)
-                        st.download_button(
-                            label="💾 Download Log File",
-                            data=log_content,
-                            file_name=f"stream_{selected_id}_logs.txt",
-                            mime="text/plain"
-                        )
-                
+                auto_refresh = st.checkbox("Auto-refresh logs", value=False)
                 if auto_refresh:
                     time.sleep(3)
                     st.rerun()
             else:
-                st.info("📝 No logs available. Start a stream to see logs.")
+                st.info("No logs available. Start a stream to see logs.")
         else:
-            st.info("📝 No logs available. Start a stream to see logs.")
+            st.info("No logs available. Start a stream to see logs.")
     
     with tab5:
         st.subheader("⚙️ Streaming Settings & Tips")
@@ -1148,12 +1175,28 @@ def main():
         ✅ **GOP Settings**: Keyframe interval optimal untuk YouTube  
         ✅ **Audio Quality**: AAC encoding dengan sample rate 44.1kHz  
         ✅ **YouTube API**: Automatic broadcast creation dan management  
+        ✅ **Auto Stream Key**: Otomatis generate stream key dari YouTube API  
         
         ### 📊 Quality Settings:
         
         - **480p**: 1000k video bitrate, 96k audio - untuk koneksi lambat
         - **720p**: 2500k video bitrate, 128k audio - recommended
         - **1080p**: 4500k video bitrate, 192k audio - untuk koneksi cepat
+        
+        ### 🚀 New Auto Features:
+        
+        **Auto YouTube Integration:**
+        - ✅ Otomatis buat YouTube Live broadcast
+        - ✅ Auto-generate stream key
+        - ✅ Auto-start/stop broadcast
+        - ✅ Direct YouTube watch links
+        - ✅ No manual stream key needed!
+        
+        **Workflow Baru:**
+        1. Connect YouTube API (sekali saja)
+        2. Upload video
+        3. Enable "Auto-create YouTube Live Broadcast"
+        4. Klik "Add Stream" - Done! 🎉
         
         ### 🔧 Troubleshooting:
         
@@ -1172,56 +1215,60 @@ def main():
         - Get stream keys automatically
         - Start/stop broadcasts remotely
         - Channel analytics integration
+        - Direct YouTube links
         """)
         
         st.subheader("🌐 Network Test")
-        if st.button("🚀 **Test Upload Speed**", type="primary"):
-            st.info("📊 Untuk test upload speed yang akurat, gunakan speedtest.net")
+        if st.button("Test Upload Speed"):
+            st.info("Untuk test upload speed yang akurat, gunakan speedtest.net")
             st.markdown("[🔗 Test Speed di Speedtest.net](https://speedtest.net)")
     
     # Instructions
     with st.sidebar.expander("📖 How to use"):
         st.markdown("""
-        ### 📋 Instructions:
+        ### Instructions:
         
-        1. **Setup YouTube API** (Optional):
+        1. **Setup YouTube API** (Recommended):
            - Go to YouTube API tab
            - Follow setup instructions
            - Connect your YouTube channel
         
         2. **Add a Stream**: 
            - Select or upload a video
-           - Enter stream key (or create via YouTube API)
+           - ✅ **Enable "Auto-create YouTube Live Broadcast"**
            - Choose quality and settings
            - Set start time
+           - **No manual stream key needed!**
         
         3. **Manage Streams**:
            - Start/stop streams manually
            - Auto-start at scheduled time
            - View logs for monitoring
            - **Streams continue running after page refresh!**
+           - **Direct YouTube links available!**
         
-        ### 🔧 Requirements:
+        ### Requirements:
         
         - FFmpeg must be installed
         - Compatible video formats (MP4 recommended)
         - Stable internet (upload speed 3x bitrate)
-        - YouTube API credentials (optional)
+        - YouTube API credentials (recommended)
         
-        ### 📊 Quality Recommendations:
+        ### Quality Recommendations:
         
         - **480p**: Upload speed minimal 3 Mbps
         - **720p**: Upload speed minimal 8 Mbps  
         - **1080p**: Upload speed minimal 15 Mbps
         
-        ### ✨ New Features:
+        ### New Features:
         
-        ✅ **YouTube API Integration**  
+        ✅ **Auto YouTube Integration**  
+        ✅ **Auto-stream key generation**  
         ✅ **Auto-broadcast creation**  
-        ✅ **Stream key generation**  
-        ✅ **Channel analytics**  
-        ✅ **Persistent authentication**  
+        ✅ **Auto-start/stop broadcasts**  
+        ✅ **Direct YouTube watch links**  
         ✅ **Enhanced error handling**  
+        ✅ **Simplified workflow**  
         """)
     
     time.sleep(1)
