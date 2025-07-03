@@ -16,6 +16,8 @@ from googleapiclient.http import MediaFileUpload
 import requests
 import json
 import shutil
+import webbrowser
+from urllib.parse import urlparse, parse_qs
 
 # YouTube API scopes
 SCOPES = ['https://www.googleapis.com/auth/youtube.force-ssl']
@@ -38,59 +40,72 @@ def get_channel_token_path(channel_name):
     return f'token_{channel_name}.json'
 
 def validate_credentials_file(file_content):
-    """Validate if uploaded file is a valid Google API credentials file"""
+    """Validate uploaded credentials file"""
     try:
-        data = json.loads(file_content)
+        credentials_data = json.loads(file_content)
         
-        # Check if it's a valid Google API credentials file
-        if 'installed' in data:
+        # Check if it's a valid OAuth2 credentials file
+        if 'installed' in credentials_data:
             required_fields = ['client_id', 'client_secret', 'auth_uri', 'token_uri']
-            installed = data['installed']
+            installed = credentials_data['installed']
             
             for field in required_fields:
                 if field not in installed:
                     return False, f"Missing required field: {field}"
             
-            return True, "Valid Google API credentials file"
+            return True, "Valid OAuth2 credentials file"
         else:
-            return False, "Invalid credentials file format. Please upload a valid Google API credentials file."
+            return False, "Invalid credentials file format. Please upload OAuth2 credentials."
     
     except json.JSONDecodeError:
-        return False, "Invalid JSON file format"
+        return False, "Invalid JSON file"
     except Exception as e:
         return False, f"Error validating file: {str(e)}"
 
-def authenticate_channel(channel_name):
-    """Authenticate a specific channel and get YouTube service"""
+def get_auth_url(channel_name):
+    """Get OAuth authorization URL for manual authentication"""
     try:
         credentials_path = get_channel_credentials_path(channel_name)
-        token_path = get_channel_token_path(channel_name)
-        
         if not os.path.exists(credentials_path):
-            return None, f"Credentials file not found for channel '{channel_name}'"
+            return None, "Credentials file not found"
         
-        # Start OAuth flow
-        flow = InstalledAppFlow.from_client_secrets_file(credentials_path, SCOPES)
+        flow = InstalledAppFlow.from_client_secrets_file(
+            credentials_path, 
+            SCOPES,
+            redirect_uri='urn:ietf:wg:oauth:2.0:oob'  # Use OOB flow for manual code entry
+        )
         
-        # Use run_local_server for authentication
-        creds = flow.run_local_server(port=0, open_browser=True)
-        
-        # Save the credentials for future use
-        with open(token_path, 'w') as token:
-            token.write(creds.to_json())
-        
-        # Test the connection
-        youtube = build('youtube', 'v3', credentials=creds)
-        response = youtube.channels().list(part='snippet,statistics', mine=True).execute()
-        
-        if response['items']:
-            channel_info = response['items'][0]
-            return youtube, f"Successfully authenticated channel: {channel_info['snippet']['title']}"
-        else:
-            return None, "Authentication successful but no channel found"
-            
+        auth_url, _ = flow.authorization_url(prompt='consent')
+        return auth_url, None
+    
     except Exception as e:
-        return None, f"Authentication failed: {str(e)}"
+        return None, f"Error generating auth URL: {str(e)}"
+
+def complete_oauth_flow(channel_name, auth_code):
+    """Complete OAuth flow with authorization code"""
+    try:
+        credentials_path = get_channel_credentials_path(channel_name)
+        if not os.path.exists(credentials_path):
+            return False, "Credentials file not found"
+        
+        flow = InstalledAppFlow.from_client_secrets_file(
+            credentials_path, 
+            SCOPES,
+            redirect_uri='urn:ietf:wg:oauth:2.0:oob'
+        )
+        
+        # Exchange authorization code for tokens
+        flow.fetch_token(code=auth_code)
+        
+        # Save tokens
+        token_path = get_channel_token_path(channel_name)
+        with open(token_path, 'w') as token_file:
+            token_file.write(flow.credentials.to_json())
+        
+        return True, "Authentication successful!"
+    
+    except Exception as e:
+        return False, f"Authentication failed: {str(e)}"
 
 def get_youtube_service(channel_name='default'):
     """Get authenticated YouTube service for specific channel"""
@@ -99,7 +114,11 @@ def get_youtube_service(channel_name='default'):
     credentials_path = get_channel_credentials_path(channel_name)
     
     if os.path.exists(token_path):
-        creds = Credentials.from_authorized_user_file(token_path, SCOPES)
+        try:
+            creds = Credentials.from_authorized_user_file(token_path, SCOPES)
+        except Exception as e:
+            st.error(f"Error loading token for {channel_name}: {e}")
+            return None
     
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
@@ -109,13 +128,16 @@ def get_youtube_service(channel_name='default'):
                 with open(token_path, 'w') as token:
                     token.write(creds.to_json())
             except Exception as e:
-                # Token refresh failed, need re-authentication
+                st.error(f"Error refreshing token for {channel_name}: {e}")
                 return None
         else:
-            # Need initial authentication
             return None
     
-    return build('youtube', 'v3', credentials=creds)
+    try:
+        return build('youtube', 'v3', credentials=creds)
+    except Exception as e:
+        st.error(f"Error building YouTube service for {channel_name}: {e}")
+        return None
 
 def get_channel_info(channel_name='default'):
     """Get channel information"""
@@ -125,7 +147,7 @@ def get_channel_info(channel_name='default'):
             return None
         
         response = youtube.channels().list(
-            part='snippet,statistics,brandingSettings',
+            part='snippet,statistics',
             mine=True
         ).execute()
         
@@ -134,14 +156,9 @@ def get_channel_info(channel_name='default'):
             return {
                 'title': channel['snippet']['title'],
                 'id': channel['id'],
-                'description': channel['snippet'].get('description', '')[:100] + '...' if len(channel['snippet'].get('description', '')) > 100 else channel['snippet'].get('description', ''),
                 'subscribers': channel['statistics'].get('subscriberCount', 'N/A'),
                 'videos': channel['statistics'].get('videoCount', 'N/A'),
-                'views': channel['statistics'].get('viewCount', 'N/A'),
-                'country': channel['snippet'].get('country', 'N/A'),
-                'custom_url': channel['snippet'].get('customUrl', 'N/A'),
-                'thumbnail': channel['snippet']['thumbnails'].get('default', {}).get('url', ''),
-                'created_at': channel['snippet'].get('publishedAt', 'N/A')
+                'views': channel['statistics'].get('viewCount', 'N/A')
             }
         return None
     except Exception as e:
@@ -149,19 +166,15 @@ def get_channel_info(channel_name='default'):
         return None
 
 def is_channel_authenticated(channel_name):
-    """Check if channel is authenticated"""
-    token_path = get_channel_token_path(channel_name)
-    credentials_path = get_channel_credentials_path(channel_name)
-    
-    if not os.path.exists(credentials_path):
-        return False
-    
-    if not os.path.exists(token_path):
-        return False
-    
+    """Check if channel is properly authenticated"""
     try:
-        creds = Credentials.from_authorized_user_file(token_path, SCOPES)
-        return creds and creds.valid
+        youtube = get_youtube_service(channel_name)
+        if not youtube:
+            return False
+        
+        # Try to make a simple API call
+        response = youtube.channels().list(part='id', mine=True).execute()
+        return len(response.get('items', [])) > 0
     except:
         return False
 
@@ -170,7 +183,7 @@ def create_youtube_broadcast(title, description, start_time_str, privacy_status=
     try:
         youtube = get_youtube_service(channel_name)
         if not youtube:
-            return None, None, f"YouTube service not available for channel '{channel_name}'. Please authenticate first."
+            return None, None, f"YouTube service not available for channel '{channel_name}'"
         
         jakarta_tz = pytz.timezone('Asia/Jakarta')
         
@@ -448,8 +461,8 @@ if 'processes' not in st.session_state:
 if 'channel_configs' not in st.session_state:
     st.session_state.channel_configs = load_channel_config()
 
-if 'uploaded_credentials' not in st.session_state:
-    st.session_state.uploaded_credentials = {}
+if 'auth_states' not in st.session_state:
+    st.session_state.auth_states = {}
 
 def save_persistent_streams(df):
     """Save streams to persistent storage"""
@@ -723,211 +736,212 @@ st.markdown("---")
 # Auto-refresh for scheduled streams
 check_scheduled_streams()
 
-# Main tabs
-tab1, tab2, tab3, tab4 = st.tabs(["📺 Stream Manager", "🔧 YouTube API Integration", "📊 Dashboard", "⚙️ Advanced Settings"])
+# Channel Management Tab
+tab1, tab2, tab3 = st.tabs(["📺 Stream Manager", "🔧 Channel Management", "📊 Dashboard"])
 
 with tab2:
-    st.header("🔧 YouTube API Integration")
-    
-    # Instructions section
-    with st.expander("📋 Setup Instructions", expanded=False):
-        st.markdown("""
-        ### 🚀 How to get YouTube API Credentials:
-        
-        1. **Go to Google Cloud Console**: Visit [Google Cloud Console](https://console.cloud.google.com/)
-        2. **Create/Select Project**: Create a new project or select existing one
-        3. **Enable YouTube API**: Go to "APIs & Services" → "Library" → Search "YouTube Data API v3" → Enable
-        4. **Create Credentials**: Go to "APIs & Services" → "Credentials" → "Create Credentials" → "OAuth 2.0 Client IDs"
-        5. **Configure OAuth**: Set application type to "Desktop application"
-        6. **Download JSON**: Download the credentials file (credentials.json)
-        7. **Upload Here**: Upload the file below with a descriptive channel name
-        
-        ### 📝 Important Notes:
-        - Each channel needs its own credentials file
-        - Use descriptive names like "main-channel", "gaming-channel", etc.
-        - After upload, click "Authenticate" to complete setup
-        """)
+    st.header("🔧 Channel Management")
     
     # Upload credentials section
-    st.subheader("📁 Add New Channel")
+    st.subheader("📁 Upload Channel Credentials")
     
-    col1, col2 = st.columns([2, 1])
+    col1, col2 = st.columns([1, 1])
     
     with col1:
-        channel_name = st.text_input(
-            "📝 Channel Name", 
-            placeholder="e.g., main-channel, gaming-channel, music-channel",
-            help="Use descriptive names to identify your channels"
-        )
+        st.markdown("### 📤 Add New Channel")
         
-        uploaded_file = st.file_uploader(
-            "📤 Upload credentials.json", 
-            type=['json'],
-            help="Upload the Google API credentials file for this channel"
-        )
-        
-        if uploaded_file and channel_name:
-            # Validate the uploaded file
-            file_content = uploaded_file.read().decode('utf-8')
-            is_valid, message = validate_credentials_file(file_content)
+        with st.form("upload_credentials", clear_on_submit=True):
+            channel_name = st.text_input(
+                "📝 Channel Name", 
+                placeholder="e.g., main-channel, gaming-channel",
+                help="Enter a unique name for this channel"
+            )
             
-            if is_valid:
-                st.success(f"✅ {message}")
-                
-                if st.button("💾 Save Credentials", type="primary"):
+            uploaded_file = st.file_uploader(
+                "📤 Upload credentials.json", 
+                type=['json'],
+                help="Upload the OAuth2 credentials file from Google Cloud Console"
+            )
+            
+            submit_button = st.form_submit_button("💾 Save Credentials")
+            
+            if submit_button:
+                if not channel_name:
+                    st.error("❌ Please enter a channel name")
+                elif not uploaded_file:
+                    st.error("❌ Please upload a credentials file")
+                else:
                     try:
-                        # Save credentials file
-                        credentials_path = get_channel_credentials_path(channel_name)
-                        with open(credentials_path, 'w') as f:
-                            f.write(file_content)
+                        # Read and validate file
+                        file_content = uploaded_file.read().decode('utf-8')
+                        is_valid, message = validate_credentials_file(file_content)
                         
-                        # Store in session state for authentication
-                        st.session_state.uploaded_credentials[channel_name] = credentials_path
-                        
-                        st.success(f"✅ Credentials saved for channel '{channel_name}'")
-                        st.info("👆 Now click the 'Authenticate' button to complete setup")
-                        st.rerun()
+                        if not is_valid:
+                            st.error(f"❌ {message}")
+                        else:
+                            # Save credentials file
+                            credentials_path = get_channel_credentials_path(channel_name)
+                            with open(credentials_path, 'w') as f:
+                                f.write(file_content)
+                            
+                            st.success(f"✅ Credentials saved for channel '{channel_name}'")
+                            st.info("📋 Now click the 'Authenticate' button below to complete setup")
+                            st.rerun()
+                            
                     except Exception as e:
                         st.error(f"❌ Error saving credentials: {e}")
-            else:
-                st.error(f"❌ {message}")
     
     with col2:
-        st.subheader("📊 Quick Stats")
+        st.markdown("### 📋 Available Channels")
+        
         available_channels = get_available_channels()
-        authenticated_channels = [ch for ch in available_channels if is_channel_authenticated(ch)]
         
-        st.metric("📺 Total Channels", len(available_channels))
-        st.metric("✅ Authenticated", len(authenticated_channels))
-        st.metric("⚠️ Need Auth", len(available_channels) - len(authenticated_channels))
-    
-    # Channel management section
-    st.subheader("📺 Manage Channels")
-    
-    available_channels = get_available_channels()
-    
-    if available_channels:
-        # Bulk actions
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            if st.button("🔄 Refresh All"):
-                st.rerun()
-        
-        with col2:
-            if st.button("🧪 Test All Connections"):
-                with st.spinner("Testing all connections..."):
-                    for channel in available_channels:
-                        if is_channel_authenticated(channel):
-                            info = get_channel_info(channel)
-                            if info:
-                                st.success(f"✅ {channel}: Connected")
-                            else:
-                                st.error(f"❌ {channel}: Connection failed")
-                        else:
-                            st.warning(f"⚠️ {channel}: Not authenticated")
-        
-        # Individual channel cards
-        for channel in available_channels:
-            with st.container():
-                # Create enhanced channel card
-                card_col1, card_col2, card_col3 = st.columns([2, 2, 1])
-                
-                with card_col1:
-                    st.write(f"### 📺 {channel}")
-                    
+        if available_channels:
+            for channel in available_channels:
+                with st.container():
                     # Check authentication status
-                    is_auth = is_channel_authenticated(channel)
+                    is_authenticated = is_channel_authenticated(channel)
                     
-                    if is_auth:
-                        st.success("✅ Authenticated")
+                    # Channel header
+                    if is_authenticated:
+                        st.success(f"✅ **{channel}** - Authenticated")
+                    else:
+                        st.error(f"❌ **{channel}** - Not Authenticated")
+                    
+                    # Channel info or authentication
+                    if is_authenticated:
+                        channel_info = get_channel_info(channel)
+                        if channel_info:
+                            col_info1, col_info2 = st.columns(2)
+                            with col_info1:
+                                st.caption(f"📊 **{channel_info['title']}**")
+                                st.caption(f"🆔 {channel_info['id']}")
+                            with col_info2:
+                                st.caption(f"👥 {channel_info['subscribers']} subscribers")
+                                st.caption(f"🎥 {channel_info['videos']} videos")
+                                st.caption(f"👁️ {channel_info['views']} views")
+                    else:
+                        # Authentication section
+                        st.warning("🔐 This channel needs authentication")
                         
-                        # Get and display channel info
-                        channel_info = get_channel_info(channel)
-                        if channel_info:
-                            st.write(f"**📊 {channel_info['title']}**")
-                            st.caption(f"🆔 ID: {channel_info['id']}")
-                            if channel_info['custom_url'] != 'N/A':
-                                st.caption(f"🔗 URL: {channel_info['custom_url']}")
+                        # Check if we're in auth flow for this channel
+                        auth_key = f"auth_{channel}"
+                        
+                        if auth_key not in st.session_state.auth_states:
+                            # Step 1: Get authorization URL
+                            if st.button(f"🔐 Authenticate {channel}", key=f"auth_btn_{channel}"):
+                                auth_url, error = get_auth_url(channel)
+                                if error:
+                                    st.error(f"❌ {error}")
+                                else:
+                                    st.session_state.auth_states[auth_key] = {
+                                        'step': 'waiting_for_code',
+                                        'auth_url': auth_url
+                                    }
+                                    st.rerun()
+                        
                         else:
-                            st.warning("⚠️ Could not fetch channel info")
-                    else:
-                        st.error("❌ Not authenticated")
-                        st.caption("Click 'Authenticate' to complete setup")
-                
-                with card_col2:
-                    if is_auth:
-                        channel_info = get_channel_info(channel)
-                        if channel_info:
-                            # Display metrics in a nice format
-                            metric_col1, metric_col2 = st.columns(2)
+                            auth_state = st.session_state.auth_states[auth_key]
                             
-                            with metric_col1:
-                                st.metric("👥 Subscribers", channel_info['subscribers'])
-                                st.metric("🎥 Videos", channel_info['videos'])
-                            
-                            with metric_col2:
-                                st.metric("👀 Views", channel_info['views'])
-                                st.metric("🌍 Country", channel_info['country'])
-                    else:
-                        st.info("📝 Authenticate to see channel metrics")
-                
-                with card_col3:
-                    # Action buttons
-                    if not is_auth:
-                        if st.button(f"🔐 Authenticate", key=f"auth_{channel}", type="primary"):
-                            with st.spinner(f"Authenticating {channel}..."):
-                                try:
-                                    youtube_service, auth_message = authenticate_channel(channel)
-                                    if youtube_service:
-                                        st.success(f"✅ {auth_message}")
-                                        st.rerun()
-                                    else:
-                                        st.error(f"❌ {auth_message}")
-                                except Exception as e:
-                                    st.error(f"❌ Authentication failed: {str(e)}")
-                    else:
-                        if st.button(f"🔄 Re-authenticate", key=f"reauth_{channel}"):
-                            # Remove existing token to force re-authentication
-                            token_path = get_channel_token_path(channel)
-                            if os.path.exists(token_path):
-                                os.remove(token_path)
-                            
-                            with st.spinner(f"Re-authenticating {channel}..."):
-                                try:
-                                    youtube_service, auth_message = authenticate_channel(channel)
-                                    if youtube_service:
-                                        st.success(f"✅ {auth_message}")
-                                        st.rerun()
-                                    else:
-                                        st.error(f"❌ {auth_message}")
-                                except Exception as e:
-                                    st.error(f"❌ Re-authentication failed: {str(e)}")
+                            if auth_state['step'] == 'waiting_for_code':
+                                st.info("🔗 **Step 1:** Click the link below to authorize:")
+                                st.markdown(f"[🔗 **Authorize {channel}**]({auth_state['auth_url']})")
+                                
+                                st.info("📋 **Step 2:** Copy the authorization code and paste it below:")
+                                
+                                with st.form(f"auth_code_form_{channel}"):
+                                    auth_code = st.text_input(
+                                        "🔑 Authorization Code",
+                                        placeholder="Paste the code from Google here...",
+                                        help="After clicking the link above, copy the code from Google and paste it here"
+                                    )
+                                    
+                                    col_submit, col_cancel = st.columns(2)
+                                    
+                                    with col_submit:
+                                        if st.form_submit_button("✅ Complete Authentication"):
+                                            if auth_code:
+                                                with st.spinner("🔄 Completing authentication..."):
+                                                    success, message = complete_oauth_flow(channel, auth_code)
+                                                    
+                                                    if success:
+                                                        st.success(f"✅ {message}")
+                                                        del st.session_state.auth_states[auth_key]
+                                                        st.rerun()
+                                                    else:
+                                                        st.error(f"❌ {message}")
+                                            else:
+                                                st.error("❌ Please enter the authorization code")
+                                    
+                                    with col_cancel:
+                                        if st.form_submit_button("❌ Cancel"):
+                                            del st.session_state.auth_states[auth_key]
+                                            st.rerun()
                     
-                    # Remove button
-                    if st.button(f"🗑️ Remove", key=f"remove_{channel}"):
-                        try:
-                            # Remove credentials and token files
-                            credentials_path = get_channel_credentials_path(channel)
-                            token_path = get_channel_token_path(channel)
-                            
-                            if os.path.exists(credentials_path):
-                                os.remove(credentials_path)
-                            if os.path.exists(token_path):
-                                os.remove(token_path)
-                            
-                            # Remove from session state
-                            if channel in st.session_state.uploaded_credentials:
-                                del st.session_state.uploaded_credentials[channel]
-                            
-                            st.success(f"✅ Channel '{channel}' removed")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"❌ Error removing channel: {e}")
-                
-                st.markdown("---")
-    else:
-        st.info("📝 No channels configured. Upload credentials above to get started!")
+                    # Action buttons
+                    col_actions1, col_actions2 = st.columns(2)
+                    
+                    with col_actions1:
+                        if is_authenticated:
+                            if st.button(f"🔄 Re-authenticate", key=f"reauth_{channel}"):
+                                # Remove existing token to force re-auth
+                                token_path = get_channel_token_path(channel)
+                                if os.path.exists(token_path):
+                                    os.remove(token_path)
+                                st.info("🔄 Token removed. Please authenticate again.")
+                                st.rerun()
+                    
+                    with col_actions2:
+                        if st.button(f"🗑️ Remove", key=f"remove_{channel}"):
+                            try:
+                                # Remove credentials and token files
+                                credentials_path = get_channel_credentials_path(channel)
+                                token_path = get_channel_token_path(channel)
+                                
+                                if os.path.exists(credentials_path):
+                                    os.remove(credentials_path)
+                                if os.path.exists(token_path):
+                                    os.remove(token_path)
+                                
+                                # Remove from auth states if present
+                                auth_key = f"auth_{channel}"
+                                if auth_key in st.session_state.auth_states:
+                                    del st.session_state.auth_states[auth_key]
+                                
+                                st.success(f"✅ Channel '{channel}' removed")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"❌ Error removing channel: {e}")
+                    
+                    st.markdown("---")
+        else:
+            st.info("📝 No channels configured. Upload credentials to get started!")
+        
+        # Bulk actions
+        if available_channels:
+            st.markdown("### 🔧 Bulk Actions")
+            
+            col_bulk1, col_bulk2 = st.columns(2)
+            
+            with col_bulk1:
+                if st.button("🧪 Test All Connections"):
+                    with st.spinner("Testing all connections..."):
+                        results = {}
+                        for channel in available_channels:
+                            results[channel] = is_channel_authenticated(channel)
+                        
+                        authenticated_count = sum(results.values())
+                        st.info(f"📊 {authenticated_count}/{len(available_channels)} channels authenticated")
+                        
+                        for channel, is_auth in results.items():
+                            if is_auth:
+                                st.success(f"✅ {channel}")
+                            else:
+                                st.error(f"❌ {channel}")
+            
+            with col_bulk2:
+                if st.button("🔄 Refresh All"):
+                    st.rerun()
 
 with tab1:
     # Sidebar for YouTube Broadcast Creation
@@ -1212,7 +1226,8 @@ with tab1:
         # Channels count
         available_channels = get_available_channels()
         authenticated_channels = [ch for ch in available_channels if is_channel_authenticated(ch)]
-        st.metric("📺 Authenticated Channels", len(authenticated_channels))
+        st.metric("📺 Available Channels", len(available_channels))
+        st.metric("✅ Authenticated Channels", len(authenticated_channels))
         
         # System resources
         try:
@@ -1232,55 +1247,27 @@ with tab3:
     st.header("📊 Multi-Channel Dashboard")
     
     available_channels = get_available_channels()
-    authenticated_channels = [ch for ch in available_channels if is_channel_authenticated(ch)]
     
-    if authenticated_channels:
-        # Overall statistics
-        st.subheader("📈 Overall Statistics")
-        
-        total_subscribers = 0
-        total_videos = 0
-        total_views = 0
-        
-        col1, col2, col3, col4 = st.columns(4)
-        
-        # Calculate totals
-        for channel in authenticated_channels:
-            channel_info = get_channel_info(channel)
-            if channel_info:
-                try:
-                    total_subscribers += int(channel_info['subscribers']) if channel_info['subscribers'] != 'N/A' else 0
-                    total_videos += int(channel_info['videos']) if channel_info['videos'] != 'N/A' else 0
-                    total_views += int(channel_info['views']) if channel_info['views'] != 'N/A' else 0
-                except:
-                    pass
-        
-        with col1:
-            st.metric("📺 Total Channels", len(authenticated_channels))
-        with col2:
-            st.metric("👥 Total Subscribers", f"{total_subscribers:,}")
-        with col3:
-            st.metric("🎥 Total Videos", f"{total_videos:,}")
-        with col4:
-            st.metric("👀 Total Views", f"{total_views:,}")
-        
+    if available_channels:
         # Channel overview
         st.subheader("📺 Channel Overview")
         
-        for channel in authenticated_channels:
+        for channel in available_channels:
             with st.expander(f"📺 {channel}", expanded=True):
                 col1, col2, col3 = st.columns(3)
                 
-                # Get channel info
-                channel_info = get_channel_info(channel)
+                # Check authentication and get channel info
+                is_authenticated = is_channel_authenticated(channel)
+                channel_info = get_channel_info(channel) if is_authenticated else None
                 
                 with col1:
-                    if channel_info:
+                    if is_authenticated and channel_info:
+                        st.success("✅ Authenticated")
                         st.metric("📊 Channel", channel_info['title'])
                         st.metric("👥 Subscribers", channel_info['subscribers'])
-                        st.metric("🎥 Videos", channel_info['videos'])
                     else:
-                        st.warning("⚠️ Could not fetch channel info")
+                        st.error("❌ Not authenticated")
+                        st.info("Please authenticate this channel first")
                 
                 with col2:
                     # Active streams for this channel
@@ -1290,122 +1277,30 @@ with tab3:
                     
                     st.metric("🟢 Active Streams", active_count)
                     st.metric("🟡 Waiting Streams", waiting_count)
-                    st.metric("📊 Total Streams", len(channel_streams))
                 
                 with col3:
-                    if channel_info:
-                        st.metric("👀 Total Views", channel_info['views'])
-                        st.metric("🌍 Country", channel_info['country'])
+                    if is_authenticated and channel_info:
+                        st.metric("🎥 Total Videos", channel_info['videos'])
+                        st.metric("👁️ Total Views", channel_info['views'])
                     
                     # Quick actions
                     if st.button(f"🔄 Refresh {channel}", key=f"refresh_{channel}"):
                         st.rerun()
         
-        # Analytics charts
+        # Stream distribution chart
         if not st.session_state.streams.empty:
-            st.subheader("📈 Stream Analytics")
+            st.subheader("📈 Stream Distribution by Channel")
             
-            col1, col2 = st.columns(2)
+            channel_counts = st.session_state.streams['Channel'].value_counts()
+            st.bar_chart(channel_counts)
             
-            with col1:
-                st.write("**📊 Streams by Channel**")
-                channel_counts = st.session_state.streams['Channel'].value_counts()
-                st.bar_chart(channel_counts)
-            
-            with col2:
-                st.write("**📊 Streams by Status**")
-                status_counts = st.session_state.streams['Status'].value_counts()
-                st.bar_chart(status_counts)
-            
-            # Quality distribution
-            st.write("**🎥 Quality Distribution**")
-            quality_counts = st.session_state.streams['Quality'].value_counts()
-            st.bar_chart(quality_counts)
+            # Status distribution
+            st.subheader("📊 Stream Status Distribution")
+            status_counts = st.session_state.streams['Status'].value_counts()
+            st.bar_chart(status_counts)
     
     else:
-        st.info("📝 No authenticated channels available. Please authenticate channels in the YouTube API Integration tab.")
-
-with tab4:
-    st.header("⚙️ Advanced Settings")
-    
-    # Application settings
-    st.subheader("🔧 Application Settings")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.write("**⏱️ Auto-refresh Settings**")
-        auto_refresh = st.checkbox("Enable auto-refresh", value=True)
-        refresh_interval = st.slider("Refresh interval (seconds)", 5, 60, 10)
-        
-        st.write("**🎥 Default Settings**")
-        default_quality = st.selectbox("Default quality", ['240p', '360p', '480p', '720p', '1080p'], index=3)
-        default_privacy = st.selectbox("Default privacy", ['public', 'unlisted', 'private'], index=0)
-    
-    with col2:
-        st.write("**📊 System Information**")
-        st.info(f"📁 Credentials files: {len([f for f in os.listdir('.') if f.startswith('credentials_')])}")
-        st.info(f"🔑 Token files: {len([f for f in os.listdir('.') if f.startswith('token_')])}")
-        st.info(f"📺 Available channels: {len(get_available_channels())}")
-        st.info(f"✅ Authenticated channels: {len([ch for ch in get_available_channels() if is_channel_authenticated(ch)])}")
-        st.info(f"📊 Total streams: {len(st.session_state.streams)}")
-    
-    # Data management
-    st.subheader("💾 Data Management")
-    
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        if st.button("📤 Export Stream Data"):
-            try:
-                st.session_state.streams.to_csv('exported_streams.csv', index=False)
-                st.success("✅ Stream data exported to 'exported_streams.csv'")
-            except Exception as e:
-                st.error(f"❌ Export failed: {e}")
-    
-    with col2:
-        uploaded_streams = st.file_uploader("📥 Import Stream Data", type=['csv'])
-        if uploaded_streams:
-            try:
-                imported_df = pd.read_csv(uploaded_streams)
-                st.session_state.streams = imported_df
-                save_persistent_streams(st.session_state.streams)
-                st.success("✅ Stream data imported successfully")
-                st.rerun()
-            except Exception as e:
-                st.error(f"❌ Import failed: {e}")
-    
-    with col3:
-        if st.button("🗑️ Clear All Stream Data", type="secondary"):
-            if st.checkbox("⚠️ I understand this will delete all stream data"):
-                st.session_state.streams = pd.DataFrame(columns=[
-                    'Video', 'Streaming Key', 'Jam Mulai', 'Status', 'PID', 'Is Shorts', 'Quality', 'Broadcast ID', 'Channel'
-                ])
-                save_persistent_streams(st.session_state.streams)
-                st.success("✅ All stream data cleared")
-                st.rerun()
-    
-    # File management
-    st.subheader("📁 File Management")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.write("**📹 Video Files**")
-        video_files = get_video_files()
-        if video_files:
-            for video in video_files[:5]:  # Show first 5
-                st.text(f"📹 {video}")
-            if len(video_files) > 5:
-                st.caption(f"... and {len(video_files) - 5} more")
-        else:
-            st.info("No video files found")
-    
-    with col2:
-        st.write("**🔧 Configuration Files**")
-        config_files = [f for f in os.listdir('.') if f.endswith('.json') or f.endswith('.csv')]
-        for config in config_files:
-            st.text(f"📄 {config}")
+        st.info("📝 No channels configured. Please add channels in the Channel Management tab.")
 
 # Footer
 st.markdown("---")
