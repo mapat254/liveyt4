@@ -11,6 +11,7 @@ import json
 import signal
 import psutil
 import urllib.parse
+from zoneinfo import ZoneInfo
 
 # Install required packages if not already installed
 required_packages = [
@@ -30,8 +31,30 @@ from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from google.oauth2.credentials import Credentials
-from googleapiclient.http import MediaFileUpload
 import requests
+
+# Jakarta timezone
+JAKARTA_TZ = ZoneInfo("Asia/Jakarta")
+
+def get_jakarta_time():
+    """Get current time in Jakarta timezone"""
+    return datetime.datetime.now(JAKARTA_TZ)
+
+def get_jakarta_time_plus_minutes(minutes=5):
+    """Get Jakarta time plus specified minutes"""
+    return get_jakarta_time() + datetime.timedelta(minutes=minutes)
+
+def format_jakarta_time(dt):
+    """Format Jakarta datetime for display"""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=JAKARTA_TZ)
+    return dt.strftime("%H:%M")
+
+def format_jakarta_datetime_full(dt):
+    """Format Jakarta datetime with full details"""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=JAKARTA_TZ)
+    return dt.strftime("%Y-%m-%d %H:%M:%S WIB")
 
 # Persistent storage files
 STREAMS_FILE = "streams_data.json"
@@ -47,10 +70,10 @@ def load_persistent_streams():
                 return pd.DataFrame(data)
         except:
             return pd.DataFrame(columns=[
-                'Video', 'Durasi', 'Jam Mulai', 'Streaming Key', 'Status', 'Is Shorts', 'Quality'
+                'Video', 'Durasi', 'Jam Mulai', 'Streaming Key', 'Status', 'Is Shorts', 'Quality', 'Thumbnail'
             ])
     return pd.DataFrame(columns=[
-        'Video', 'Durasi', 'Jam Mulai', 'Streaming Key', 'Status', 'Is Shorts', 'Quality'
+        'Video', 'Durasi', 'Jam Mulai', 'Streaming Key', 'Status', 'Is Shorts', 'Quality', 'Thumbnail'
     ])
 
 def save_persistent_streams(streams_df):
@@ -229,73 +252,61 @@ def get_youtube_service():
             return None
     return None
 
-def upload_thumbnail(service, broadcast_id, thumbnail_file):
-    """Upload thumbnail to YouTube broadcast"""
+def upload_thumbnail(service, video_id, thumbnail_file):
+    """Upload thumbnail to YouTube video"""
     try:
         # Save uploaded file temporarily
-        temp_path = f"temp_thumbnail_{broadcast_id}.jpg"
+        temp_path = f"temp_thumbnail_{video_id}.jpg"
         with open(temp_path, "wb") as f:
             f.write(thumbnail_file.getbuffer())
         
         # Upload thumbnail
-        media = MediaFileUpload(temp_path, mimetype='image/jpeg')
-        request = service.thumbnails().set(videoId=broadcast_id, media_body=media)
-        response = request.execute()
+        service.thumbnails().set(
+            videoId=video_id,
+            media_body=temp_path
+        ).execute()
         
         # Clean up temp file
         os.remove(temp_path)
-        
-        return True, "Thumbnail uploaded successfully"
+        return True
     except Exception as e:
-        # Clean up temp file if exists
-        temp_path = f"temp_thumbnail_{broadcast_id}.jpg"
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-        return False, str(e)
-
-def get_uploaded_videos():
-    """Get list of uploaded videos with file info"""
-    video_extensions = ('.mp4', '.flv', '.avi', '.mov', '.mkv', '.webm', '.m4v')
-    video_files = []
-    
-    for file in os.listdir('.'):
-        if file.lower().endswith(video_extensions):
-            try:
-                file_size = os.path.getsize(file)
-                file_size_mb = file_size / (1024 * 1024)
-                video_files.append({
-                    'name': file,
-                    'size': f"{file_size_mb:.1f} MB",
-                    'path': file
-                })
-            except:
-                video_files.append({
-                    'name': file,
-                    'size': "Unknown",
-                    'path': file
-                })
-    
-    return video_files
+        st.error(f"Error uploading thumbnail: {e}")
+        return False
 
 def create_youtube_broadcast(title, description, start_time, privacy_status='unlisted', 
-                           made_for_kids=False, enable_auto_start=True, enable_auto_stop=True,
-                           enable_dvr=True, enable_content_encryption=False, enable_embed=True,
-                           record_from_start=True, start_with_slate=False, 
-                           monitor_stream_health=True, enable_closed_captions=False,
-                           projection='rectangular', latency_preference='normal',
-                           selected_video=None, thumbnail_file=None):
-    """Create a YouTube Live broadcast with complete settings"""
+                           category_id='20', tags=None, thumbnail_file=None, 
+                           enable_auto_start=True, enable_auto_stop=False,
+                           enable_dvr=True, enable_content_encryption=False,
+                           enable_embed=True, record_from_start=True,
+                           enable_closed_captions=False, enable_low_latency=False,
+                           made_for_kids=False):
+    """Create a YouTube Live broadcast with comprehensive settings"""
     service = get_youtube_service()
     if not service:
         return None, None
     
     try:
-        # Create broadcast with all settings
+        # Convert start_time to Jakarta timezone if needed
+        if start_time.tzinfo is None:
+            start_time = start_time.replace(tzinfo=JAKARTA_TZ)
+        
+        # Convert to UTC for YouTube API
+        start_time_utc = start_time.astimezone(datetime.timezone.utc)
+        
+        # Prepare tags
+        if tags is None:
+            tags = []
+        elif isinstance(tags, str):
+            tags = [tag.strip() for tag in tags.split(',') if tag.strip()]
+        
+        # Create broadcast
         broadcast_body = {
             'snippet': {
                 'title': title,
                 'description': description,
-                'scheduledStartTime': start_time.isoformat() + 'Z'
+                'scheduledStartTime': start_time_utc.isoformat(),
+                'categoryId': category_id,
+                'tags': tags
             },
             'status': {
                 'privacyStatus': privacy_status,
@@ -308,14 +319,8 @@ def create_youtube_broadcast(title, description, start_time, privacy_status='unl
                 'enableContentEncryption': enable_content_encryption,
                 'enableEmbed': enable_embed,
                 'recordFromStart': record_from_start,
-                'startWithSlate': start_with_slate,
-                'monitorStream': {
-                    'enableMonitorStream': monitor_stream_health,
-                    'broadcastStreamDelayMs': 0
-                },
                 'enableClosedCaptions': enable_closed_captions,
-                'projection': projection,
-                'latencyPreference': latency_preference
+                'enableLowLatency': enable_low_latency
             }
         }
         
@@ -327,12 +332,12 @@ def create_youtube_broadcast(title, description, start_time, privacy_status='unl
         broadcast_id = broadcast_response['id']
         
         # Upload thumbnail if provided
-        thumbnail_success = True
-        thumbnail_message = ""
         if thumbnail_file:
-            thumbnail_success, thumbnail_message = upload_thumbnail(service, broadcast_id, thumbnail_file)
+            upload_success = upload_thumbnail(service, broadcast_id, thumbnail_file)
+            if not upload_success:
+                st.warning("⚠️ Broadcast created but thumbnail upload failed")
         
-        # Create stream with resolution
+        # Create stream
         stream_response = service.liveStreams().insert(
             part='snippet,cdn',
             body={
@@ -340,8 +345,7 @@ def create_youtube_broadcast(title, description, start_time, privacy_status='unl
                     'title': f'Stream for {title}'
                 },
                 'cdn': {
-                    'resolution': '1080p',  # Required field
-                    'frameRate': '30fps',
+                    'format': '1080p',
                     'ingestionType': 'rtmp'
                 }
             }
@@ -359,18 +363,14 @@ def create_youtube_broadcast(title, description, start_time, privacy_status='unl
         
         watch_url = f"https://www.youtube.com/watch?v={broadcast_id}"
         
-        result = {
+        return {
             'broadcast_id': broadcast_id,
             'stream_id': stream_id,
             'stream_key': stream_key,
             'watch_url': watch_url,
             'title': title,
-            'selected_video': selected_video,
-            'thumbnail_uploaded': thumbnail_success,
-            'thumbnail_message': thumbnail_message
-        }
-        
-        return result, None
+            'scheduled_start_time': start_time.strftime("%Y-%m-%d %H:%M:%S WIB")
+        }, None
         
     except Exception as e:
         return None, str(e)
@@ -476,7 +476,7 @@ def reconnect_to_existing_streams():
                     st.session_state.streams.loc[row_id, 'Status'] = 'Sedang Live'
                     active_streams[str(row_id)] = {
                         'pid': pid,
-                        'started_at': datetime.datetime.now().isoformat()
+                        'started_at': get_jakarta_time().isoformat()
                     }
             else:
                 cleanup_stream_files(row_id)
@@ -541,7 +541,7 @@ def run_ffmpeg(video_path, stream_key, is_shorts, row_id, quality="720p"):
     
     log_file = f"stream_{row_id}.log"
     with open(log_file, "w") as f:
-        f.write(f"Starting optimized stream for {video_path} at {datetime.datetime.now()}\n")
+        f.write(f"Starting optimized stream for {video_path} at {format_jakarta_datetime_full(get_jakarta_time())}\n")
         f.write(f"Quality: {quality}, Shorts: {is_shorts}\n")
     
     settings = get_quality_settings(quality, is_shorts)
@@ -620,7 +620,7 @@ def run_ffmpeg(video_path, stream_key, is_shorts, row_id, quality="720p"):
         active_streams = load_active_streams()
         active_streams[str(row_id)] = {
             'pid': process.pid,
-            'started_at': datetime.datetime.now().isoformat()
+            'started_at': get_jakarta_time().isoformat()
         }
         save_active_streams(active_streams)
         
@@ -755,8 +755,7 @@ def check_stream_statuses():
     """Check status files for all streams and update accordingly"""
     active_streams = load_active_streams()
     
-    for idx in range(len(st.session_state.streams)):
-        row = st.session_state.streams.iloc[idx]
+    for idx, row in st.session_state.streams.iterrows():
         status_file = f"stream_{idx}.status"
         
         if str(idx) in active_streams:
@@ -798,10 +797,9 @@ def check_stream_statuses():
 
 def check_scheduled_streams():
     """Check for streams that need to be started based on schedule"""
-    current_time = datetime.datetime.now().strftime("%H:%M")
+    current_time = get_jakarta_time().strftime("%H:%M")
     
-    for idx in range(len(st.session_state.streams)):
-        row = st.session_state.streams.iloc[idx]
+    for idx, row in st.session_state.streams.iterrows():
         if row['Status'] == 'Menunggu' and row['Jam Mulai'] == current_time:
             quality = row.get('Quality', '720p')
             start_stream(row['Video'], row['Streaming Key'], row.get('Is Shorts', False), idx, quality)
@@ -814,14 +812,6 @@ def get_stream_logs(row_id, max_lines=100):
             lines = f.readlines()
         return lines[-max_lines:] if len(lines) > max_lines else lines
     return []
-
-def get_current_time_plus_minutes(minutes=5):
-    """Get current time plus specified minutes"""
-    return datetime.datetime.now() + datetime.timedelta(minutes=minutes)
-
-def format_time_for_display(dt):
-    """Format datetime for display"""
-    return dt.strftime("%H:%M")
 
 def main():
     st.set_page_config(
@@ -853,7 +843,14 @@ def main():
     # Reconnect to existing streams after page refresh
     reconnect_to_existing_streams()
     
-    # Sidebar for ads
+    # Current Jakarta time display
+    current_time = get_jakarta_time()
+    
+    # Sidebar for ads and time info
+    st.sidebar.markdown("### 🕐 Waktu Jakarta")
+    st.sidebar.info(f"**Waktu Sekarang:** {current_time.strftime('%H:%M:%S')} WIB")
+    st.sidebar.info(f"**Tanggal:** {current_time.strftime('%d %B %Y')}")
+    
     show_ads = st.sidebar.checkbox("Tampilkan Iklan", value=False)
     if show_ads:
         st.sidebar.subheader("Iklan Sponsor")
@@ -879,11 +876,6 @@ def main():
     if st.sidebar.button("🔄 Refresh Status"):
         st.rerun()
     
-    # Show current time
-    current_time = datetime.datetime.now()
-    st.sidebar.info(f"🕐 Current Time: {current_time.strftime('%H:%M:%S')}")
-    st.sidebar.info(f"📅 Date: {current_time.strftime('%Y-%m-%d')}")
-    
     # Show persistent stream info
     active_streams = load_active_streams()
     if active_streams:
@@ -906,234 +898,181 @@ def main():
     tab1, tab2, tab3, tab4, tab5 = st.tabs(["Stream Manager", "Add New Stream", "YouTube API", "Logs", "Settings"])
     
     with tab1:
-        st.subheader("📊 Manage Streams")
+        st.subheader("Manage Streams")
         
         st.caption("✅ Status akan diperbarui otomatis. Streaming akan tetap berjalan meski halaman di-refresh.")
         st.caption("🎯 Optimized untuk YouTube Live dengan pengaturan encoding terbaik")
+        st.caption(f"🕐 Waktu Jakarta: {current_time.strftime('%H:%M:%S')} WIB")
         
-        # Bulk actions
         if not st.session_state.streams.empty:
-            col1, col2, col3, col4 = st.columns(4)
-            
-            with col1:
-                if st.button("🗑️ Clear Completed"):
-                    completed_mask = st.session_state.streams['Status'].isin(['Selesai', 'Dihentikan', 'Terputus'])
-                    st.session_state.streams = st.session_state.streams[~completed_mask].reset_index(drop=True)
-                    save_persistent_streams(st.session_state.streams)
-                    st.rerun()
-            
-            with col2:
-                if st.button("⏹️ Stop All"):
-                    for idx in range(len(st.session_state.streams)):
-                        row = st.session_state.streams.iloc[idx]
-                        if row['Status'] == 'Sedang Live':
-                            stop_stream(idx)
-                    st.rerun()
-            
-            with col3:
-                if st.button("🔄 Refresh All"):
-                    st.rerun()
-            
-            with col4:
-                if st.button("📥 Export CSV"):
-                    csv = st.session_state.streams.to_csv(index=False)
-                    st.download_button(
-                        label="Download CSV",
-                        data=csv,
-                        file_name=f"streams_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                        mime="text/csv"
-                    )
-            
-            st.markdown("---")
-            
-            # Stream counter
-            total_streams = len(st.session_state.streams)
-            live_streams = len(st.session_state.streams[st.session_state.streams['Status'] == 'Sedang Live'])
-            waiting_streams = len(st.session_state.streams[st.session_state.streams['Status'] == 'Menunggu'])
-            
-            col1, col2, col3 = st.columns(3)
-            col1.metric("📊 Total Streams", total_streams)
-            col2.metric("🟢 Live Streams", live_streams)
-            col3.metric("🟡 Waiting Streams", waiting_streams)
-            
-            st.markdown("---")
-            
-            # Enhanced table display
-            header_cols = st.columns([2, 1, 1, 1, 2, 2, 2])
-            header_cols[0].markdown("**📹 Video**")
-            header_cols[1].markdown("**⏱️ Duration**")
-            header_cols[2].markdown("**🕐 Start Time**")
-            header_cols[3].markdown("**🎬 Quality**")
-            header_cols[4].markdown("**🔑 Stream Key**")
-            header_cols[5].markdown("**📊 Status**")
-            header_cols[6].markdown("**⚡ Actions**")
-            
-            for i in range(len(st.session_state.streams)):
-                row = st.session_state.streams.iloc[i]
-                cols = st.columns([2, 1, 1, 1, 2, 2, 2])
-                
-                # Video name with icon
-                video_name = os.path.basename(row['Video']) if row['Video'] else "No video"
-                if row.get('Is Shorts', False):
-                    cols[0].write(f"📱 {video_name}")
-                else:
-                    cols[0].write(f"🎥 {video_name}")
-                
-                cols[1].write(row['Durasi'])
-                cols[2].write(row['Jam Mulai'])
-                
-                # Quality with badge
-                quality = row.get('Quality', '720p')
-                if quality == '1080p':
-                    cols[3].markdown(f"🔥 **{quality}**")
-                elif quality == '720p':
-                    cols[3].markdown(f"⭐ **{quality}**")
-                else:
-                    cols[3].markdown(f"📱 **{quality}**")
-                
-                # Masked stream key
-                masked_key = row['Streaming Key'][:4] + "****" if len(row['Streaming Key']) > 4 else "****"
-                cols[4].write(f"🔐 {masked_key}")
-                
-                # Status with enhanced styling
-                status = row['Status']
-                if status == 'Sedang Live':
-                    cols[5].markdown(f"🟢 **{status}**")
-                elif status == 'Menunggu':
-                    cols[5].markdown(f"🟡 **{status}**")
-                elif status == 'Selesai':
-                    cols[5].markdown(f"🔵 **{status}**")
-                elif status == 'Dihentikan':
-                    cols[5].markdown(f"🟠 **{status}**")
-                elif status.startswith('error:'):
-                    cols[5].markdown(f"🔴 **Error**")
-                    if cols[5].button("ℹ️", key=f"error_info_{i}"):
-                        st.error(f"Error details: {status}")
-                else:
-                    cols[5].write(status)
-                
-                # Action buttons
-                if row['Status'] == 'Menunggu':
-                    if cols[6].button("▶️ Start", key=f"start_{i}"):
-                        quality = row.get('Quality', '720p')
-                        if start_stream(row['Video'], row['Streaming Key'], row.get('Is Shorts', False), i, quality):
-                            st.rerun()
-                
-                elif row['Status'] == 'Sedang Live':
-                    if cols[6].button("⏹️ Stop", key=f"stop_{i}"):
-                        if stop_stream(i):
-                            st.rerun()
-                
-                elif row['Status'] in ['Selesai', 'Dihentikan', 'Terputus'] or row['Status'].startswith('error:'):
-                    action_col1, action_col2 = cols[6].columns(2)
-                    if action_col1.button("🔄", key=f"restart_{i}", help="Restart"):
-                        st.session_state.streams.loc[i, 'Status'] = 'Menunggu'
-                        save_persistent_streams(st.session_state.streams)
-                        st.rerun()
-                    if action_col2.button("🗑️", key=f"remove_{i}", help="Remove"):
-                        st.session_state.streams = st.session_state.streams.drop(i).reset_index(drop=True)
-                        save_persistent_streams(st.session_state.streams)
-                        log_file = f"stream_{i}.log"
-                        if os.path.exists(log_file):
-                            os.remove(log_file)
-                        st.rerun()
+            # Display streams in a more organized way
+            for i, row in st.session_state.streams.iterrows():
+                with st.container():
+                    col1, col2, col3, col4 = st.columns([3, 2, 2, 1])
+                    
+                    with col1:
+                        st.write(f"**📹 {os.path.basename(row['Video'])}**")
+                        st.caption(f"Quality: {row.get('Quality', '720p')} | Duration: {row['Durasi']}")
+                        if row.get('Thumbnail'):
+                            st.caption(f"🖼️ Thumbnail: {row['Thumbnail']}")
+                    
+                    with col2:
+                        st.write(f"**⏰ Start Time:** {row['Jam Mulai']} WIB")
+                        masked_key = row['Streaming Key'][:4] + "****" if len(row['Streaming Key']) > 4 else "****"
+                        st.caption(f"🔑 Key: {masked_key}")
+                    
+                    with col3:
+                        status = row['Status']
+                        if status == 'Sedang Live':
+                            st.markdown(f"🟢 **{status}**")
+                        elif status == 'Menunggu':
+                            # Calculate time until start
+                            try:
+                                start_time_str = row['Jam Mulai']
+                                start_hour, start_minute = map(int, start_time_str.split(':'))
+                                start_time_today = current_time.replace(hour=start_hour, minute=start_minute, second=0, microsecond=0)
+                                
+                                if start_time_today < current_time:
+                                    start_time_today += datetime.timedelta(days=1)
+                                
+                                time_diff = start_time_today - current_time
+                                hours, remainder = divmod(int(time_diff.total_seconds()), 3600)
+                                minutes, _ = divmod(remainder, 60)
+                                
+                                if hours > 0:
+                                    st.markdown(f"🟡 **{status}**")
+                                    st.caption(f"⏰ Mulai dalam {hours}j {minutes}m")
+                                else:
+                                    st.markdown(f"🟡 **{status}**")
+                                    st.caption(f"⏰ Mulai dalam {minutes}m")
+                            except:
+                                st.markdown(f"🟡 **{status}**")
+                        elif status == 'Selesai':
+                            st.markdown(f"🔵 **{status}**")
+                        elif status == 'Dihentikan':
+                            st.markdown(f"🟠 **{status}**")
+                        elif status.startswith('error:'):
+                            st.markdown(f"🔴 **Error**")
+                            st.caption(status.replace('error: ', ''))
+                        else:
+                            st.write(status)
+                    
+                    with col4:
+                        if row['Status'] == 'Menunggu':
+                            if st.button("▶️ Start", key=f"start_{i}"):
+                                quality = row.get('Quality', '720p')
+                                if start_stream(row['Video'], row['Streaming Key'], row.get('Is Shorts', False), i, quality):
+                                    st.rerun()
+                        
+                        elif row['Status'] == 'Sedang Live':
+                            if st.button("⏹️ Stop", key=f"stop_{i}"):
+                                if stop_stream(i):
+                                    st.rerun()
+                        
+                        elif row['Status'] in ['Selesai', 'Dihentikan', 'Terputus'] or row['Status'].startswith('error:'):
+                            if st.button("🗑️ Remove", key=f"remove_{i}"):
+                                st.session_state.streams = st.session_state.streams.drop(i).reset_index(drop=True)
+                                save_persistent_streams(st.session_state.streams)
+                                log_file = f"stream_{i}.log"
+                                if os.path.exists(log_file):
+                                    os.remove(log_file)
+                                st.rerun()
+                    
+                    st.divider()
         else:
-            st.info("📝 No streams added yet. Use the 'Add New Stream' tab to add a stream.")
+            st.info("No streams added yet. Use the 'Add New Stream' tab to add a stream.")
     
     with tab2:
-        st.subheader("➕ Add New Stream")
+        st.subheader("Add New Stream")
         
-        # Get uploaded videos
-        video_files = get_uploaded_videos()
+        # Quick time buttons
+        st.markdown("### ⏰ Quick Time Selection")
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            if st.button("🚀 Start Now"):
+                st.session_state.selected_start_time = current_time.time()
+        
+        with col2:
+            if st.button("⏰ +5 min"):
+                future_time = get_jakarta_time_plus_minutes(5)
+                st.session_state.selected_start_time = future_time.time()
+        
+        with col3:
+            if st.button("⏰ +15 min"):
+                future_time = get_jakarta_time_plus_minutes(15)
+                st.session_state.selected_start_time = future_time.time()
+        
+        with col4:
+            if st.button("⏰ +30 min"):
+                future_time = get_jakarta_time_plus_minutes(30)
+                st.session_state.selected_start_time = future_time.time()
+        
+        st.divider()
+        
+        video_files = [f for f in os.listdir('.') if f.endswith(('.mp4', '.flv', '.avi', '.mov', '.mkv'))]
         
         col1, col2 = st.columns(2)
         
         with col1:
-            st.markdown("### 📹 Video Selection")
+            st.write("**📹 Video Selection:**")
+            selected_video = st.selectbox("Pilih video yang sudah ada", [""] + video_files) if video_files else None
             
-            if video_files:
-                st.write("**Available videos:**")
-                video_options = [""] + [f"{v['name']} ({v['size']})" for v in video_files]
-                selected_video_option = st.selectbox("Choose video", video_options)
-                
-                if selected_video_option:
-                    selected_video = selected_video_option.split(" (")[0]
-                    video_path = selected_video
-                else:
-                    video_path = None
-            else:
-                st.info("No videos found. Upload a video below.")
-                video_path = None
-            
-            uploaded_file = st.file_uploader("Or upload new video", type=['mp4', 'flv', 'avi', 'mov', 'mkv', 'webm', 'm4v'])
+            uploaded_file = st.file_uploader("Atau upload video baru", type=['mp4', 'flv', 'avi', 'mov', 'mkv'])
             
             if uploaded_file:
                 with open(uploaded_file.name, "wb") as f:
                     f.write(uploaded_file.getbuffer())
-                st.success(f"✅ Video uploaded: {uploaded_file.name}")
+                st.success("✅ Video berhasil diupload!")
                 video_path = uploaded_file.name
+            elif selected_video:
+                video_path = selected_video
+            else:
+                video_path = None
+            
+            # Thumbnail upload
+            st.write("**🖼️ Thumbnail (Optional):**")
+            thumbnail_file = st.file_uploader("Upload thumbnail", type=['jpg', 'jpeg', 'png'])
+            thumbnail_name = thumbnail_file.name if thumbnail_file else None
         
         with col2:
-            st.markdown("### ⚙️ Stream Settings")
+            st.write("**⚙️ Stream Settings:**")
+            stream_key = st.text_input("Stream Key", type="password")
             
-            stream_key = st.text_input("🔑 Stream Key", type="password", 
-                                     help="Get this from YouTube Studio or use YouTube API tab")
-            
-            # Time settings with current time
-            current_time = datetime.datetime.now()
-            
-            # Quick time options
-            st.markdown("**⏰ Quick Start Options:**")
-            time_col1, time_col2, time_col3 = st.columns(3)
-            
-            with time_col1:
-                if st.button("🚀 Start Now"):
-                    start_time = current_time
-                    st.session_state.selected_start_time = start_time.time()
-            
-            with time_col2:
-                if st.button("⏰ +5 min"):
-                    start_time = get_current_time_plus_minutes(5)
-                    st.session_state.selected_start_time = start_time.time()
-            
-            with time_col3:
-                if st.button("⏰ +15 min"):
-                    start_time = get_current_time_plus_minutes(15)
-                    st.session_state.selected_start_time = start_time.time()
-            
-            # Manual time input
+            # Use selected time from quick buttons or manual input
             default_time = st.session_state.get('selected_start_time', current_time.time())
-            start_time = st.time_input("🕐 Start Time", value=default_time)
+            start_time = st.time_input("Start Time (WIB)", value=default_time)
             start_time_str = start_time.strftime("%H:%M")
             
             # Show time difference
-            start_datetime = datetime.datetime.combine(current_time.date(), start_time)
-            if start_datetime < current_time:
-                start_datetime += datetime.timedelta(days=1)  # Next day
-            
-            time_diff = start_datetime - current_time
-            if time_diff.total_seconds() > 0:
-                hours, remainder = divmod(int(time_diff.total_seconds()), 3600)
-                minutes, _ = divmod(remainder, 60)
-                if hours > 0:
-                    st.info(f"⏰ Will start in {hours}h {minutes}m")
+            try:
+                start_hour, start_minute = start_time.hour, start_time.minute
+                start_time_today = current_time.replace(hour=start_hour, minute=start_minute, second=0, microsecond=0)
+                
+                if start_time_today < current_time:
+                    start_time_today += datetime.timedelta(days=1)
+                    st.info(f"⏰ Will start tomorrow at {start_time_str} WIB")
                 else:
-                    st.info(f"⏰ Will start in {minutes}m")
-            else:
-                st.warning("⚠️ Start time is in the past - will start immediately")
+                    time_diff = start_time_today - current_time
+                    hours, remainder = divmod(int(time_diff.total_seconds()), 3600)
+                    minutes, _ = divmod(remainder, 60)
+                    
+                    if hours > 0:
+                        st.info(f"⏰ Will start in {hours}h {minutes}m")
+                    elif minutes > 0:
+                        st.info(f"⏰ Will start in {minutes}m")
+                    else:
+                        st.success("🚀 Will start immediately!")
+            except:
+                pass
             
-            duration = st.text_input("⏱️ Duration (HH:MM:SS)", value="01:00:00")
+            duration = st.text_input("Duration (HH:MM:SS)", value="01:00:00")
             
-            quality = st.selectbox("🎬 Quality", ["480p", "720p", "1080p"], index=1,
-                                 help="Higher quality requires faster internet")
+            quality = st.selectbox("Quality", ["480p", "720p", "1080p"], index=1)
             
-            is_shorts = st.checkbox("📱 Shorts Mode (Vertical)", 
-                                  help="Optimized for YouTube Shorts")
+            is_shorts = st.checkbox("Mode Shorts (Vertical)")
         
-        st.markdown("---")
-        
-        # Add stream button
-        if st.button("➕ Add Stream", type="primary"):
+        if st.button("➕ Add Stream"):
             if video_path and stream_key:
                 video_filename = os.path.basename(video_path)
                 
@@ -1144,7 +1083,8 @@ def main():
                     'Streaming Key': [stream_key],
                     'Status': ['Menunggu'],
                     'Is Shorts': [is_shorts],
-                    'Quality': [quality]
+                    'Quality': [quality],
+                    'Thumbnail': [thumbnail_name]
                 })
                 
                 st.session_state.streams = pd.concat([st.session_state.streams, new_stream], ignore_index=True)
@@ -1158,7 +1098,7 @@ def main():
                 st.rerun()
             else:
                 if not video_path:
-                    st.error("❌ Please select or upload a video")
+                    st.error("❌ Please provide a video path")
                 if not stream_key:
                     st.error("❌ Please provide a streaming key")
     
@@ -1205,194 +1145,180 @@ def main():
             channel_info = get_channel_info()
             if channel_info:
                 col1, col2, col3, col4 = st.columns(4)
-                col1.metric("📺 Channel", channel_info['title'])
-                col2.metric("👥 Subscribers", channel_info['subscriber_count'])
-                col3.metric("👁️ Total Views", channel_info['view_count'])
-                col4.metric("🎥 Videos", channel_info['video_count'])
+                col1.metric("Channel", channel_info['title'])
+                col2.metric("Subscribers", channel_info['subscriber_count'])
+                col3.metric("Total Views", channel_info['view_count'])
+                col4.metric("Videos", channel_info['video_count'])
             
-            st.markdown("---")
             st.subheader("🎬 Create YouTube Live Broadcast")
             
-            # Get uploaded videos for selection
-            video_files = get_uploaded_videos()
+            # Quick time buttons for broadcast
+            st.markdown("### ⏰ Quick Time Selection")
+            col1, col2, col3, col4 = st.columns(4)
             
-            with st.form("create_broadcast"):
-                col1, col2 = st.columns(2)
+            with col1:
+                if st.button("🚀 Broadcast Now", key="broadcast_now"):
+                    st.session_state.broadcast_time = current_time.time()
+            
+            with col2:
+                if st.button("⏰ +5 min", key="broadcast_5min"):
+                    future_time = get_jakarta_time_plus_minutes(5)
+                    st.session_state.broadcast_time = future_time.time()
+            
+            with col3:
+                if st.button("⏰ +15 min", key="broadcast_15min"):
+                    future_time = get_jakarta_time_plus_minutes(15)
+                    st.session_state.broadcast_time = future_time.time()
+            
+            with col4:
+                if st.button("⏰ +30 min", key="broadcast_30min"):
+                    future_time = get_jakarta_time_plus_minutes(30)
+                    st.session_state.broadcast_time = future_time.time()
+            
+            st.divider()
+            
+            # Broadcast creation form
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                broadcast_title = st.text_input("🎬 Broadcast Title", value="Live Stream")
+                broadcast_description = st.text_area("📝 Description", value="Live streaming with automated scheduler")
                 
-                with col1:
-                    st.markdown("#### 📝 Basic Information")
-                    broadcast_title = st.text_input("🎬 Broadcast Title", value="Live Stream")
-                    broadcast_description = st.text_area("📄 Description", 
-                                                        value="Live streaming with automated scheduler",
-                                                        height=100)
-                    
-                    # Video selection
-                    st.markdown("#### 📹 Video Selection")
-                    if video_files:
-                        video_options = ["None"] + [f"{v['name']} ({v['size']})" for v in video_files]
-                        selected_video_option = st.selectbox("Choose video for this broadcast", video_options)
-                        
-                        if selected_video_option != "None":
-                            selected_video = selected_video_option.split(" (")[0]
-                        else:
-                            selected_video = None
-                    else:
-                        st.info("No videos available. Upload videos in 'Add New Stream' tab.")
-                        selected_video = None
-                    
-                    # Thumbnail upload
-                    st.markdown("#### 🖼️ Thumbnail")
-                    thumbnail_file = st.file_uploader("Upload Custom Thumbnail", 
-                                                    type=['jpg', 'jpeg', 'png'],
-                                                    help="Recommended: 1280x720 pixels")
-                    
-                    if thumbnail_file:
-                        st.image(thumbnail_file, caption="Thumbnail Preview", width=300)
+                # Video selection for auto-add
+                video_files = [f for f in os.listdir('.') if f.endswith(('.mp4', '.flv', '.avi', '.mov', '.mkv'))]
+                selected_video_for_broadcast = st.selectbox("📹 Select Video (for auto-add)", [""] + video_files)
                 
-                with col2:
-                    st.markdown("#### ⏰ Schedule")
-                    
-                    # Current time display
-                    current_time = datetime.datetime.now()
-                    st.info(f"🕐 Current Time: {current_time.strftime('%H:%M:%S')}")
-                    
-                    # Quick time options for broadcast
-                    st.markdown("**Quick Start Options:**")
-                    quick_col1, quick_col2, quick_col3 = st.columns(3)
-                    
-                    with quick_col1:
-                        if st.form_submit_button("🚀 Now"):
-                            broadcast_datetime = current_time
-                            st.session_state.broadcast_date = broadcast_datetime.date()
-                            st.session_state.broadcast_time = broadcast_datetime.time()
-                    
-                    with quick_col2:
-                        if st.form_submit_button("⏰ +5min"):
-                            broadcast_datetime = get_current_time_plus_minutes(5)
-                            st.session_state.broadcast_date = broadcast_datetime.date()
-                            st.session_state.broadcast_time = broadcast_datetime.time()
-                    
-                    with quick_col3:
-                        if st.form_submit_button("⏰ +15min"):
-                            broadcast_datetime = get_current_time_plus_minutes(15)
-                            st.session_state.broadcast_date = broadcast_datetime.date()
-                            st.session_state.broadcast_time = broadcast_datetime.time()
-                    
-                    # Manual date/time input
-                    default_date = st.session_state.get('broadcast_date', current_time.date())
-                    default_time = st.session_state.get('broadcast_time', current_time.time())
-                    
-                    broadcast_date = st.date_input("📅 Date", value=default_date)
-                    broadcast_time = st.time_input("🕐 Time", value=default_time)
-                    
-                    # Show time until broadcast
+                # Thumbnail upload
+                thumbnail_file = st.file_uploader("🖼️ Upload Thumbnail", type=['jpg', 'jpeg', 'png'], key="broadcast_thumbnail")
+                
+                # Tags
+                tags_input = st.text_input("🏷️ Tags (comma separated)", placeholder="gaming, live, stream")
+            
+            with col2:
+                # Time settings
+                default_broadcast_time = st.session_state.get('broadcast_time', current_time.time())
+                broadcast_date = st.date_input("📅 Date", value=current_time.date())
+                broadcast_time = st.time_input("⏰ Time (WIB)", value=default_broadcast_time)
+                
+                # Show time difference for broadcast
+                try:
                     broadcast_datetime = datetime.datetime.combine(broadcast_date, broadcast_time)
-                    time_diff = broadcast_datetime - current_time
+                    broadcast_datetime = broadcast_datetime.replace(tzinfo=JAKARTA_TZ)
                     
-                    if time_diff.total_seconds() > 0:
+                    if broadcast_datetime < current_time:
+                        if broadcast_date == current_time.date():
+                            broadcast_datetime += datetime.timedelta(days=1)
+                            st.info(f"⏰ Will start tomorrow at {broadcast_time.strftime('%H:%M')} WIB")
+                        else:
+                            st.warning("⚠️ Selected time is in the past")
+                    else:
+                        time_diff = broadcast_datetime - current_time
                         hours, remainder = divmod(int(time_diff.total_seconds()), 3600)
                         minutes, _ = divmod(remainder, 60)
+                        
                         if hours > 0:
-                            st.success(f"⏰ Broadcast in {hours}h {minutes}m")
+                            st.info(f"⏰ Will start in {hours}h {minutes}m")
+                        elif minutes > 0:
+                            st.info(f"⏰ Will start in {minutes}m")
                         else:
-                            st.success(f"⏰ Broadcast in {minutes}m")
-                    else:
-                        st.warning("⚠️ Broadcast time is in the past")
-                    
-                    st.markdown("#### 🔒 Privacy & Settings")
-                    privacy_status = st.selectbox("🔒 Privacy", ["unlisted", "public", "private"], index=0)
-                    
-                    # Audience settings
-                    st.markdown("**👶 Audience**")
-                    made_for_kids = st.radio(
-                        "Is this content made for kids?",
-                        [False, True],
-                        format_func=lambda x: "No, it's not made for kids" if not x else "Yes, it's made for kids",
-                        index=0
-                    )
-                    
-                    # Advanced settings
-                    with st.expander("⚙️ Advanced Settings"):
-                        enable_auto_start = st.checkbox("🚀 Auto-start broadcast", value=True)
-                        enable_auto_stop = st.checkbox("⏹️ Auto-stop broadcast", value=True)
-                        enable_dvr = st.checkbox("📹 Enable DVR", value=True)
-                        enable_embed = st.checkbox("🔗 Allow embedding", value=True)
-                        record_from_start = st.checkbox("📼 Record from start", value=True)
-                        monitor_stream_health = st.checkbox("🏥 Monitor stream health", value=True)
-                        
-                        latency_preference = st.selectbox("⚡ Latency", ["normal", "low", "ultraLow"], index=0)
+                            st.success("🚀 Will start immediately!")
+                except:
+                    pass
                 
-                # Create broadcast button
-                create_broadcast = st.form_submit_button("🔴 Create Broadcast", type="primary")
+                # Settings
+                privacy_status = st.selectbox("🔒 Privacy", ["unlisted", "public", "private"], index=0)
+                category_id = st.selectbox("📂 Category", [
+                    ("20", "Gaming"),
+                    ("24", "Entertainment"),
+                    ("25", "News & Politics"),
+                    ("26", "Howto & Style"),
+                    ("27", "Education"),
+                    ("28", "Science & Technology"),
+                    ("10", "Music"),
+                    ("15", "Pets & Animals"),
+                    ("17", "Sports"),
+                    ("19", "Travel & Events"),
+                    ("22", "People & Blogs"),
+                    ("23", "Comedy"),
+                    ("1", "Film & Animation"),
+                    ("2", "Autos & Vehicles")
+                ], format_func=lambda x: x[1])
                 
-                if create_broadcast:
-                    if broadcast_title:
-                        # Combine date and time
-                        start_datetime = datetime.datetime.combine(broadcast_date, broadcast_time)
+                # Advanced settings
+                with st.expander("⚙️ Advanced Settings"):
+                    made_for_kids = st.checkbox("👶 Made for Kids", value=False)
+                    enable_auto_start = st.checkbox("🚀 Auto Start", value=True)
+                    enable_auto_stop = st.checkbox("⏹️ Auto Stop", value=False)
+                    enable_dvr = st.checkbox("📹 Enable DVR", value=True)
+                    enable_embed = st.checkbox("🔗 Allow Embedding", value=True)
+                    record_from_start = st.checkbox("🎥 Record from Start", value=True)
+                    enable_low_latency = st.checkbox("⚡ Low Latency", value=False)
+            
+            if st.button("🔴 Create Broadcast"):
+                if broadcast_title:
+                    # Combine date and time with Jakarta timezone
+                    start_datetime = datetime.datetime.combine(broadcast_date, broadcast_time)
+                    start_datetime = start_datetime.replace(tzinfo=JAKARTA_TZ)
+                    
+                    with st.spinner("Creating YouTube Live broadcast..."):
+                        broadcast_info, error = create_youtube_broadcast(
+                            title=broadcast_title,
+                            description=broadcast_description,
+                            start_time=start_datetime,
+                            privacy_status=privacy_status,
+                            category_id=category_id[0],
+                            tags=tags_input,
+                            thumbnail_file=thumbnail_file,
+                            enable_auto_start=enable_auto_start,
+                            enable_auto_stop=enable_auto_stop,
+                            enable_dvr=enable_dvr,
+                            enable_embed=enable_embed,
+                            record_from_start=record_from_start,
+                            enable_low_latency=enable_low_latency,
+                            made_for_kids=made_for_kids
+                        )
+                    
+                    if broadcast_info:
+                        st.success("✅ Broadcast created successfully!")
                         
-                        with st.spinner("Creating YouTube Live broadcast..."):
-                            broadcast_info, error = create_youtube_broadcast(
-                                title=broadcast_title,
-                                description=broadcast_description,
-                                start_time=start_datetime,
-                                privacy_status=privacy_status,
-                                made_for_kids=made_for_kids,
-                                enable_auto_start=enable_auto_start,
-                                enable_auto_stop=enable_auto_stop,
-                                enable_dvr=enable_dvr,
-                                enable_embed=enable_embed,
-                                record_from_start=record_from_start,
-                                monitor_stream_health=monitor_stream_health,
-                                latency_preference=latency_preference,
-                                selected_video=selected_video,
-                                thumbnail_file=thumbnail_file
-                            )
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.info(f"**🔑 Stream Key:** `{broadcast_info['stream_key']}`")
+                            st.info(f"**🆔 Broadcast ID:** `{broadcast_info['broadcast_id']}`")
+                            st.info(f"**⏰ Scheduled:** {broadcast_info['scheduled_start_time']}")
+                        with col2:
+                            st.info(f"**🔗 Watch URL:** {broadcast_info['watch_url']}")
+                            st.markdown(f"[🎬 Open YouTube Live]({broadcast_info['watch_url']})")
                         
-                        if broadcast_info:
-                            st.success("✅ Broadcast created successfully!")
+                        # Auto-add to streams if video selected
+                        if selected_video_for_broadcast:
+                            new_stream = pd.DataFrame({
+                                'Video': [selected_video_for_broadcast],
+                                'Durasi': ['01:00:00'],
+                                'Jam Mulai': [broadcast_time.strftime("%H:%M")],
+                                'Streaming Key': [broadcast_info['stream_key']],
+                                'Status': ['Menunggu'],
+                                'Is Shorts': [False],
+                                'Quality': ['720p'],
+                                'Thumbnail': [thumbnail_file.name if thumbnail_file else None]
+                            })
                             
-                            # Show broadcast info
-                            info_col1, info_col2 = st.columns(2)
-                            with info_col1:
-                                st.info(f"**🔑 Stream Key:** `{broadcast_info['stream_key']}`")
-                                st.info(f"**🆔 Broadcast ID:** `{broadcast_info['broadcast_id']}`")
-                                if broadcast_info.get('thumbnail_uploaded'):
-                                    st.success(f"**🖼️ Thumbnail:** {broadcast_info['thumbnail_message']}")
+                            st.session_state.streams = pd.concat([st.session_state.streams, new_stream], ignore_index=True)
+                            save_persistent_streams(st.session_state.streams)
+                            st.success("✅ Auto-added to Stream Manager!")
                             
-                            with info_col2:
-                                st.info(f"**🔗 Watch URL:** {broadcast_info['watch_url']}")
-                                st.markdown(f"[🎬 Open YouTube Live]({broadcast_info['watch_url']})")
-                                if selected_video:
-                                    st.info(f"**📹 Selected Video:** {selected_video}")
+                            # Clear broadcast time
+                            if 'broadcast_time' in st.session_state:
+                                del st.session_state.broadcast_time
                             
-                            # Auto-add to streams if video is selected
-                            if selected_video:
-                                new_stream = pd.DataFrame({
-                                    'Video': [selected_video],
-                                    'Durasi': ['01:00:00'],
-                                    'Jam Mulai': [broadcast_time.strftime("%H:%M")],
-                                    'Streaming Key': [broadcast_info['stream_key']],
-                                    'Status': ['Menunggu'],
-                                    'Is Shorts': [False],
-                                    'Quality': ['720p']
-                                })
-                                
-                                st.session_state.streams = pd.concat([st.session_state.streams, new_stream], ignore_index=True)
-                                save_persistent_streams(st.session_state.streams)
-                                st.success("✅ Automatically added to Stream Manager!")
-                                
-                                # Clear session state
-                                if 'broadcast_date' in st.session_state:
-                                    del st.session_state.broadcast_date
-                                if 'broadcast_time' in st.session_state:
-                                    del st.session_state.broadcast_time
-                        else:
-                            st.error(f"❌ Error creating broadcast: {error}")
+                            st.rerun()
                     else:
-                        st.error("Please enter a broadcast title")
+                        st.error(f"❌ Error creating broadcast: {error}")
+                else:
+                    st.error("❌ Please enter a broadcast title")
             
             # Disconnect option
-            st.markdown("---")
+            st.divider()
             if st.button("🔌 Disconnect YouTube API"):
                 if os.path.exists(YOUTUBE_CREDENTIALS_FILE):
                     os.remove(YOUTUBE_CREDENTIALS_FILE)
@@ -1403,7 +1329,7 @@ def main():
                 st.rerun()
     
     with tab4:
-        st.subheader("📋 Stream Logs")
+        st.subheader("📊 Stream Logs")
         
         log_files = [f for f in os.listdir('.') if f.startswith('stream_') and f.endswith('.log')]
         stream_ids = [int(f.split('_')[1].split('.')[0]) for f in log_files]
@@ -1411,35 +1337,20 @@ def main():
         if stream_ids:
             stream_options = {}
             for idx in stream_ids:
-                if idx < len(st.session_state.streams):
-                    video_name = os.path.basename(st.session_state.streams.iloc[idx]['Video'])
+                if idx in st.session_state.streams.index:
+                    video_name = os.path.basename(st.session_state.streams.loc[idx, 'Video'])
                     stream_options[f"{video_name} (ID: {idx})"] = idx
             
             if stream_options:
                 selected_stream = st.selectbox("Select stream to view logs", options=list(stream_options.keys()))
                 selected_id = stream_options[selected_stream]
                 
-                col1, col2 = st.columns([3, 1])
-                with col2:
-                    auto_refresh = st.checkbox("🔄 Auto-refresh", value=False)
-                    if st.button("📥 Download Log"):
-                        log_file = f"stream_{selected_id}.log"
-                        if os.path.exists(log_file):
-                            with open(log_file, "r") as f:
-                                log_content = f.read()
-                            st.download_button(
-                                label="Download",
-                                data=log_content,
-                                file_name=f"stream_{selected_id}_log.txt",
-                                mime="text/plain"
-                            )
-                
                 logs = get_stream_logs(selected_id)
-                if logs:
-                    st.code("".join(logs), language="bash")
-                else:
-                    st.info("No logs available for this stream")
+                log_container = st.container()
+                with log_container:
+                    st.code("".join(logs))
                 
+                auto_refresh = st.checkbox("Auto-refresh logs", value=False)
                 if auto_refresh:
                     time.sleep(3)
                     st.rerun()
@@ -1451,14 +1362,16 @@ def main():
     with tab5:
         st.subheader("⚙️ Streaming Settings & Tips")
         
-        # Current time display
-        current_time = datetime.datetime.now()
-        st.info(f"🕐 Current Time: {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        st.markdown(f"""
+        ### 🕐 Timezone Information
         
-        st.markdown("""
+        **Current Jakarta Time:** {current_time.strftime('%H:%M:%S')} WIB  
+        **Date:** {current_time.strftime('%A, %d %B %Y')}  
+        **Timezone:** Asia/Jakarta (UTC+7)
+        
         ### 🎯 Optimizations Applied:
         
-        ✅ **Smart Time Management**: Auto-follow current time with quick options  
+        ✅ **Jakarta Timezone**: All times displayed in WIB (Waktu Indonesia Barat)  
         ✅ **Bitrate Control**: Adaptive bitrate dengan buffer yang optimal  
         ✅ **Low Latency**: Tune zerolatency untuk streaming real-time  
         ✅ **Reconnection**: Auto-reconnect jika koneksi terputus  
@@ -1466,19 +1379,19 @@ def main():
         ✅ **Audio Quality**: AAC encoding dengan sample rate 44.1kHz  
         ✅ **YouTube API**: Automatic broadcast creation dan management  
         
-        ### ⏰ Time Management Features:
-        
-        - **Current Time Display**: Always shows current time
-        - **Quick Start Options**: Start now, +5min, +15min buttons
-        - **Smart Scheduling**: Auto-calculate time differences
-        - **Past Time Warning**: Alerts for past start times
-        - **Auto-refresh**: Real-time time updates
-        
         ### 📊 Quality Settings:
         
         - **480p**: 1000k video bitrate, 96k audio - untuk koneksi lambat
         - **720p**: 2500k video bitrate, 128k audio - recommended
         - **1080p**: 4500k video bitrate, 192k audio - untuk koneksi cepat
+        
+        ### ⏰ Time Management Features:
+        
+        - **Quick Start Buttons**: Start now, +5min, +15min, +30min
+        - **Jakarta Time Display**: Real-time WIB clock
+        - **Smart Scheduling**: Auto-calculate time differences
+        - **Next Day Detection**: Handles overnight scheduling
+        - **Time Validation**: Prevents invalid times
         
         ### 🔧 Troubleshooting:
         
@@ -1497,23 +1410,21 @@ def main():
         - Get stream keys automatically
         - Start/stop broadcasts remotely
         - Channel analytics integration
-        - Custom thumbnail upload
-        - Complete broadcast settings
+        - Thumbnail upload support
+        - Advanced broadcast settings
         """)
         
         st.subheader("🌐 Network Test")
         if st.button("Test Upload Speed"):
             st.info("Untuk test upload speed yang akurat, gunakan speedtest.net")
             st.markdown("[🔗 Test Speed di Speedtest.net](https://speedtest.net)")
-        
-        st.subheader("🕐 Time Zone Settings")
-        st.info(f"Current timezone: {datetime.datetime.now().astimezone().tzinfo}")
-        st.caption("All times are displayed in your local timezone")
     
     # Instructions
     with st.sidebar.expander("📖 How to use"):
-        st.markdown("""
+        st.markdown(f"""
         ### Instructions:
+        
+        **Current Time:** {current_time.strftime('%H:%M:%S')} WIB
         
         1. **Setup YouTube API** (Optional):
            - Go to YouTube API tab
@@ -1521,24 +1432,17 @@ def main():
            - Connect your YouTube channel
         
         2. **Add a Stream**: 
+           - Use quick time buttons for fast scheduling
            - Select or upload a video
            - Enter stream key (or create via YouTube API)
            - Choose quality and settings
-           - Set start time (use quick options!)
+           - Set start time in WIB
         
         3. **Manage Streams**:
            - Start/stop streams manually
            - Auto-start at scheduled time
            - View logs for monitoring
            - **Streams continue running after page refresh!**
-        
-        ### ⏰ New Time Features:
-        
-        ✅ **Smart Time Selection**  
-        ✅ **Quick Start Buttons**  
-        ✅ **Current Time Display**  
-        ✅ **Time Difference Calculator**  
-        ✅ **Past Time Warnings**  
         
         ### Requirements:
         
@@ -1552,9 +1456,21 @@ def main():
         - **480p**: Upload speed minimal 3 Mbps
         - **720p**: Upload speed minimal 8 Mbps  
         - **1080p**: Upload speed minimal 15 Mbps
+        
+        ### New Features:
+        
+        ✅ **Jakarta Timezone Support**  
+        ✅ **Quick Time Buttons**  
+        ✅ **Real-time Clock Display**  
+        ✅ **Smart Time Calculation**  
+        ✅ **YouTube API Integration**  
+        ✅ **Auto-broadcast creation**  
+        ✅ **Stream key generation**  
+        ✅ **Channel analytics**  
+        ✅ **Thumbnail upload support**  
+        ✅ **Enhanced error handling**  
         """)
     
-    # Auto-refresh every 30 seconds for time updates
     time.sleep(1)
 
 if __name__ == '__main__':
