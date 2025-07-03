@@ -1,360 +1,156 @@
-import sys
+import streamlit as st
+import pandas as pd
 import subprocess
 import threading
 import time
 import os
-import streamlit.components.v1 as components
-import shutil
-import datetime
-import pandas as pd
-import json
-import signal
 import psutil
-import urllib.parse
+import datetime
 import pytz
-
-# Install required packages if not already installed
-required_packages = [
-    "streamlit", "pandas", "psutil", 
-    "google-auth", "google-auth-oauthlib", 
-    "google-auth-httplib2", "google-api-python-client", "requests", "pytz"
-]
-
-for package in required_packages:
-    try:
-        __import__(package.replace("-", "_"))
-    except ImportError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", package])
-
-import streamlit as st
 from google.auth.transport.requests import Request
-from google_auth_oauthlib.flow import Flow
-from googleapiclient.discovery import build
 from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from googleapiclient.http import MediaFileUpload
 import requests
+import json
 
-# Persistent storage files
-STREAMS_FILE = "streams_data.json"
-ACTIVE_STREAMS_FILE = "active_streams.json"
-YOUTUBE_CREDENTIALS_FILE = "youtube_credentials.json"
-THUMBNAIL_QUOTA_FILE = "thumbnail_quota.json"
+# YouTube API scopes
+SCOPES = ['https://www.googleapis.com/auth/youtube.force-ssl']
 
 def get_jakarta_time():
     """Get current time in Jakarta timezone"""
     jakarta_tz = pytz.timezone('Asia/Jakarta')
     return datetime.datetime.now(jakarta_tz)
 
-def load_persistent_streams():
-    """Load streams from persistent storage"""
-    if os.path.exists(STREAMS_FILE):
-        try:
-            with open(STREAMS_FILE, "r") as f:
-                data = json.load(f)
-                return pd.DataFrame(data)
-        except:
-            return pd.DataFrame(columns=[
-                'Video', 'Durasi', 'Jam Mulai', 'Streaming Key', 'Status', 'Is Shorts', 'Quality', 'Broadcast ID', 'Watch URL'
-            ])
-    return pd.DataFrame(columns=[
-        'Video', 'Durasi', 'Jam Mulai', 'Streaming Key', 'Status', 'Is Shorts', 'Quality', 'Broadcast ID', 'Watch URL'
-    ])
-
-def save_persistent_streams(streams_df):
-    """Save streams to persistent storage"""
-    try:
-        with open(STREAMS_FILE, "w") as f:
-            json.dump(streams_df.to_dict('records'), f, indent=2)
-    except Exception as e:
-        st.error(f"Error saving streams: {e}")
-
-def load_active_streams():
-    """Load active streams tracking"""
-    if os.path.exists(ACTIVE_STREAMS_FILE):
-        try:
-            with open(ACTIVE_STREAMS_FILE, "r") as f:
-                return json.load(f)
-        except:
-            return {}
-    return {}
-
-def save_active_streams(active_streams):
-    """Save active streams tracking"""
-    try:
-        with open(ACTIVE_STREAMS_FILE, "w") as f:
-            json.dump(active_streams, f, indent=2)
-    except Exception as e:
-        st.error(f"Error saving active streams: {e}")
-
-def load_thumbnail_quota():
-    """Load thumbnail upload quota tracking"""
-    if os.path.exists(THUMBNAIL_QUOTA_FILE):
-        try:
-            with open(THUMBNAIL_QUOTA_FILE, "r") as f:
-                data = json.load(f)
-                # Clean up old entries (older than 24 hours)
-                current_time = datetime.datetime.now().timestamp()
-                data['uploads'] = [upload for upload in data['uploads'] 
-                                 if current_time - upload < 24 * 3600]
-                return data
-        except:
-            return {'uploads': []}
-    return {'uploads': []}
-
-def save_thumbnail_quota(quota_data):
-    """Save thumbnail upload quota tracking"""
-    try:
-        with open(THUMBNAIL_QUOTA_FILE, "w") as f:
-            json.dump(quota_data, f, indent=2)
-    except Exception as e:
-        st.error(f"Error saving thumbnail quota: {e}")
-
-def can_upload_thumbnail():
-    """Check if thumbnail upload is within quota limits"""
-    quota_data = load_thumbnail_quota()
-    current_time = datetime.datetime.now().timestamp()
-    
-    # Count uploads in last 24 hours (daily limit: 50)
-    daily_uploads = len(quota_data['uploads'])
-    
-    # Count uploads in last hour (hourly limit: 10)
-    hourly_uploads = len([upload for upload in quota_data['uploads'] 
-                         if current_time - upload < 3600])
-    
-    return daily_uploads < 50 and hourly_uploads < 10, daily_uploads, hourly_uploads
-
-def record_thumbnail_upload():
-    """Record a thumbnail upload"""
-    quota_data = load_thumbnail_quota()
-    quota_data['uploads'].append(datetime.datetime.now().timestamp())
-    save_thumbnail_quota(quota_data)
-
-def save_youtube_credentials(credentials):
-    """Save YouTube credentials to file"""
-    try:
-        creds_data = {
-            'token': credentials.token,
-            'refresh_token': credentials.refresh_token,
-            'token_uri': credentials.token_uri,
-            'client_id': credentials.client_id,
-            'client_secret': credentials.client_secret,
-            'scopes': credentials.scopes
-        }
-        with open(YOUTUBE_CREDENTIALS_FILE, "w") as f:
-            json.dump(creds_data, f, indent=2)
-        return True
-    except Exception as e:
-        st.error(f"Error saving credentials: {e}")
-        return False
-
-def load_youtube_credentials():
-    """Load YouTube credentials from file"""
-    if os.path.exists(YOUTUBE_CREDENTIALS_FILE):
-        try:
-            with open(YOUTUBE_CREDENTIALS_FILE, "r") as f:
-                creds_data = json.load(f)
-            
-            credentials = Credentials(
-                token=creds_data.get('token'),
-                refresh_token=creds_data.get('refresh_token'),
-                token_uri=creds_data.get('token_uri'),
-                client_id=creds_data.get('client_id'),
-                client_secret=creds_data.get('client_secret'),
-                scopes=creds_data.get('scopes')
-            )
-            
-            # Refresh if expired
-            if credentials.expired and credentials.refresh_token:
-                credentials.refresh(Request())
-                save_youtube_credentials(credentials)
-            
-            return credentials
-        except Exception as e:
-            st.error(f"Error loading credentials: {e}")
-            return None
-    return None
-
-def handle_oauth_callback():
-    """Handle OAuth callback from URL parameters"""
-    # Check if we have authorization code in URL parameters
-    query_params = st.experimental_get_query_params()
-    
-    if 'code' in query_params and 'client_id' in st.session_state and 'client_secret' in st.session_state:
-        try:
-            auth_code = query_params['code'][0]
-            
-            # Exchange authorization code for tokens
-            token_url = "https://oauth2.googleapis.com/token"
-            
-            data = {
-                'client_id': st.session_state.client_id,
-                'client_secret': st.session_state.client_secret,
-                'code': auth_code,
-                'grant_type': 'authorization_code',
-                'redirect_uri': 'https://liveyt4.streamlit.app'  # Your actual Streamlit app URL
-            }
-            
-            response = requests.post(token_url, data=data)
-            
-            if response.status_code == 200:
-                token_data = response.json()
-                
-                # Create credentials object
-                credentials = Credentials(
-                    token=token_data['access_token'],
-                    refresh_token=token_data.get('refresh_token'),
-                    token_uri=token_url,
-                    client_id=st.session_state.client_id,
-                    client_secret=st.session_state.client_secret,
-                    scopes=['https://www.googleapis.com/auth/youtube.force-ssl']
-                )
-                
-                # Save credentials
-                if save_youtube_credentials(credentials):
-                    st.session_state.youtube_authenticated = True
-                    st.session_state.youtube_credentials = credentials
-                    st.success("✅ YouTube authentication successful!")
-                    
-                    # Clear URL parameters
-                    st.experimental_set_query_params()
-                    st.rerun()
-                else:
-                    st.error("Failed to save credentials")
-            else:
-                st.error(f"Token exchange failed: {response.text}")
-                
-        except Exception as e:
-            st.error(f"Error handling OAuth callback: {e}")
-
-def authenticate_youtube_manual():
-    """Manual YouTube authentication with proper redirect URI"""
-    if 'client_id' not in st.session_state or 'client_secret' not in st.session_state:
-        st.error("Please enter Client ID and Client Secret first")
-        return
-    
-    try:
-        # Create OAuth URL manually
-        client_id = st.session_state.client_id
-        redirect_uri = "https://liveyt4.streamlit.app"  # Your actual Streamlit app URL
-        scope = "https://www.googleapis.com/auth/youtube.force-ssl"
-        
-        auth_url = (
-            f"https://accounts.google.com/o/oauth2/auth?"
-            f"client_id={client_id}&"
-            f"redirect_uri={urllib.parse.quote(redirect_uri)}&"
-            f"scope={urllib.parse.quote(scope)}&"
-            f"response_type=code&"
-            f"access_type=offline&"
-            f"prompt=consent"
-        )
-        
-        st.markdown(f"""
-        ### 🔐 YouTube Authentication
-        
-        **Step 1:** Click the link below to authorize the application:
-        
-        **[🔗 Authorize YouTube Access]({auth_url})**
-        
-        **Step 2:** After authorization, you will be redirected back to this page automatically.
-        
-        **Step 3:** The page will refresh and show authentication success.
-        
-        ---
-        
-        **Note:** Make sure you're logged into the correct Google account that owns the YouTube channel you want to stream to.
-        """)
-        
-    except Exception as e:
-        st.error(f"Error creating authentication URL: {e}")
+def format_jakarta_time(dt):
+    """Format Jakarta time for display"""
+    return dt.strftime('%H:%M WIB')
 
 def get_youtube_service():
     """Get authenticated YouTube service"""
-    credentials = load_youtube_credentials()
-    if credentials:
-        try:
-            service = build('youtube', 'v3', credentials=credentials)
-            return service
-        except Exception as e:
-            st.error(f"Error creating YouTube service: {e}")
-            return None
-    return None
-
-def upload_thumbnail(video_id, thumbnail_file):
-    """Upload thumbnail to YouTube video"""
-    service = get_youtube_service()
-    if not service:
-        return False, "YouTube service not available"
+    creds = None
+    if os.path.exists('token.json'):
+        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
     
-    # Check quota before uploading
-    can_upload, daily_count, hourly_count = can_upload_thumbnail()
-    if not can_upload:
-        return False, f"Thumbnail quota exceeded. Daily: {daily_count}/50, Hourly: {hourly_count}/10"
-    
-    try:
-        # Upload thumbnail
-        service.thumbnails().set(
-            videoId=video_id,
-            media_body=thumbnail_file
-        ).execute()
-        
-        # Record the upload
-        record_thumbnail_upload()
-        
-        return True, "Thumbnail uploaded successfully"
-        
-    except Exception as e:
-        error_msg = str(e)
-        if "429" in error_msg or "uploadRateLimitExceeded" in error_msg:
-            return False, "YouTube rate limit exceeded. Please try again later (max 10/hour, 50/day)."
-        elif "403" in error_msg:
-            return False, "Permission denied. Make sure your API has thumbnail upload permissions."
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
         else:
-            return False, f"Upload failed: {error_msg}"
-
-def create_youtube_broadcast(title, description, start_time, privacy_status='unlisted', quality='720p', thumbnail_file=None):
-    """Create a YouTube Live broadcast"""
-    service = get_youtube_service()
-    if not service:
-        return None, None
+            if os.path.exists('credentials.json'):
+                flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
+                creds = flow.run_local_server(port=0)
+            else:
+                st.error("❌ credentials.json file not found! Please upload your YouTube API credentials.")
+                return None
+        
+        with open('token.json', 'w') as token:
+            token.write(creds.to_json())
     
+    return build('youtube', 'v3', credentials=creds)
+
+def create_youtube_broadcast(title, description, start_time_str, privacy_status='public', is_shorts=False):
+    """Create YouTube live broadcast with proper time synchronization"""
     try:
+        youtube = get_youtube_service()
+        if not youtube:
+            return None, None, "YouTube service not available"
+        
+        jakarta_tz = pytz.timezone('Asia/Jakarta')
+        
+        # Handle different time formats
+        if start_time_str == "NOW":
+            # For NOW broadcasts, set start time to current time
+            start_time = get_jakarta_time()
+            scheduled_start_time = start_time.isoformat()
+        else:
+            try:
+                # Parse time string (HH:MM format)
+                time_parts = start_time_str.split(':')
+                hour = int(time_parts[0])
+                minute = int(time_parts[1])
+                
+                # Create datetime for today with specified time
+                now = get_jakarta_time()
+                start_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                
+                # If time has passed today, schedule for tomorrow
+                if start_time <= now:
+                    start_time += datetime.timedelta(days=1)
+                
+                scheduled_start_time = start_time.isoformat()
+            except:
+                # Fallback to current time
+                start_time = get_jakarta_time()
+                scheduled_start_time = start_time.isoformat()
+        
+        # Broadcast snippet
+        broadcast_snippet = {
+            'title': title,
+            'description': description,
+            'scheduledStartTime': scheduled_start_time,
+        }
+        
+        # Broadcast status - CRITICAL: Use 'ready' for immediate streams
+        if start_time_str == "NOW":
+            broadcast_status = {
+                'privacyStatus': privacy_status,
+                'lifeCycleStatus': 'ready'  # Ready to go live immediately
+            }
+        else:
+            broadcast_status = {
+                'privacyStatus': privacy_status,
+                'lifeCycleStatus': 'created'  # Scheduled for later
+            }
+        
         # Create broadcast
-        broadcast_response = service.liveBroadcasts().insert(
-            part='snippet,status',
+        broadcast_response = youtube.liveBroadcasts().insert(
+            part='snippet,status,contentDetails',
             body={
-                'snippet': {
-                    'title': title,
-                    'description': description,
-                    'scheduledStartTime': start_time.isoformat() + 'Z'
-                },
-                'status': {
-                    'privacyStatus': privacy_status,
-                    'selfDeclaredMadeForKids': False
+                'snippet': broadcast_snippet,
+                'status': broadcast_status,
+                'contentDetails': {
+                    'enableAutoStart': True,
+                    'enableAutoStop': True,
+                    'recordFromStart': True,
+                    'enableDvr': True,
+                    'enableContentEncryption': False,
+                    'enableEmbed': True,
+                    'latencyPreference': 'low'
                 }
             }
         ).execute()
         
         broadcast_id = broadcast_response['id']
         
-        # Map quality to YouTube resolution format
+        # Create live stream with proper resolution
+        stream_snippet = {
+            'title': f"{title} - Stream",
+            'description': f"Live stream for {title}"
+        }
+        
+        # Set resolution based on quality
         resolution_map = {
+            '240p': '240p',
+            '360p': '360p', 
             '480p': '480p',
-            '720p': '720p', 
+            '720p': '720p',
             '1080p': '1080p'
         }
         
-        # Create stream with proper resolution
-        stream_response = service.liveStreams().insert(
+        stream_cdn = {
+            'format': '1080p',  # Default format
+            'ingestionType': 'rtmp',
+            'resolution': resolution_map.get('720p', '720p'),
+            'frameRate': '30fps'
+        }
+        
+        stream_response = youtube.liveStreams().insert(
             part='snippet,cdn',
             body={
-                'snippet': {
-                    'title': f'Stream for {title}'
-                },
-                'cdn': {
-                    'format': resolution_map.get(quality, '720p'),
-                    'ingestionType': 'rtmp',
-                    'resolution': resolution_map.get(quality, '720p'),
-                    'frameRate': '30fps'
-                }
+                'snippet': stream_snippet,
+                'cdn': stream_cdn
             }
         ).execute()
         
@@ -362,490 +158,307 @@ def create_youtube_broadcast(title, description, start_time, privacy_status='unl
         stream_key = stream_response['cdn']['ingestionInfo']['streamName']
         
         # Bind broadcast to stream
-        service.liveBroadcasts().bind(
-            part='id',
+        youtube.liveBroadcasts().bind(
+            part='id,contentDetails',
             id=broadcast_id,
             streamId=stream_id
         ).execute()
         
-        watch_url = f"https://www.youtube.com/watch?v={broadcast_id}"
+        # For NOW broadcasts, transition to live immediately
+        if start_time_str == "NOW":
+            try:
+                # Wait a moment for binding to complete
+                time.sleep(2)
+                
+                # Transition to testing state first
+                youtube.liveBroadcasts().transition(
+                    broadcastStatus='testing',
+                    id=broadcast_id,
+                    part='id,status'
+                ).execute()
+                
+                st.success(f"✅ Broadcast created and ready to go live!")
+                
+            except Exception as e:
+                st.warning(f"⚠️ Broadcast created but transition failed: {str(e)}")
         
-        # Upload thumbnail if provided
-        thumbnail_success = True
-        thumbnail_message = ""
-        if thumbnail_file:
-            thumbnail_success, thumbnail_message = upload_thumbnail(broadcast_id, thumbnail_file)
-            if not thumbnail_success:
-                st.warning(f"⚠️ Broadcast created but thumbnail upload failed: {thumbnail_message}")
+        return broadcast_id, stream_key, None
         
-        return {
-            'broadcast_id': broadcast_id,
-            'stream_id': stream_id,
-            'stream_key': stream_key,
-            'watch_url': watch_url,
-            'title': title,
-            'thumbnail_uploaded': thumbnail_success
-        }, None
-        
+    except HttpError as e:
+        error_details = e.error_details[0] if e.error_details else {}
+        return None, None, f"YouTube API Error: {error_details.get('message', str(e))}"
     except Exception as e:
-        error_msg = str(e)
-        if "Resolution is required" in error_msg:
-            return None, "Stream resolution error. Please try again with a different quality setting."
-        elif "429" in error_msg:
-            return None, "YouTube API rate limit exceeded. Please wait a few minutes and try again."
-        else:
-            return None, error_msg
+        return None, None, f"Error creating broadcast: {str(e)}"
 
 def start_youtube_broadcast(broadcast_id):
-    """Start a YouTube Live broadcast"""
-    service = get_youtube_service()
-    if not service:
-        return False, "YouTube service not available"
-    
+    """Start YouTube broadcast - transition from testing to live"""
     try:
-        service.liveBroadcasts().transition(
-            part='id',
-            id=broadcast_id,
-            broadcastStatus='live'
+        youtube = get_youtube_service()
+        if not youtube:
+            return False, "YouTube service not available"
+        
+        # Get current broadcast status
+        broadcast_response = youtube.liveBroadcasts().list(
+            part='status,snippet',
+            id=broadcast_id
         ).execute()
+        
+        if not broadcast_response['items']:
+            return False, "Broadcast not found"
+        
+        current_status = broadcast_response['items'][0]['status']['lifeCycleStatus']
+        
+        # Transition based on current status
+        if current_status == 'ready':
+            # Transition to testing first
+            youtube.liveBroadcasts().transition(
+                broadcastStatus='testing',
+                id=broadcast_id,
+                part='id,status'
+            ).execute()
+            time.sleep(3)  # Wait for transition
+            
+            # Then transition to live
+            youtube.liveBroadcasts().transition(
+                broadcastStatus='live',
+                id=broadcast_id,
+                part='id,status'
+            ).execute()
+            
+        elif current_status == 'testing':
+            # Direct transition to live
+            youtube.liveBroadcasts().transition(
+                broadcastStatus='live',
+                id=broadcast_id,
+                part='id,status'
+            ).execute()
+        
         return True, "Broadcast started successfully"
+        
+    except HttpError as e:
+        error_details = e.error_details[0] if e.error_details else {}
+        return False, f"Failed to start broadcast: {error_details.get('message', str(e))}"
     except Exception as e:
-        return False, str(e)
+        return False, f"Error starting broadcast: {str(e)}"
 
 def stop_youtube_broadcast(broadcast_id):
-    """Stop a YouTube Live broadcast"""
-    service = get_youtube_service()
-    if not service:
-        return False, "YouTube service not available"
-    
+    """Stop YouTube broadcast"""
     try:
-        service.liveBroadcasts().transition(
-            part='id',
+        youtube = get_youtube_service()
+        if not youtube:
+            return False, "YouTube service not available"
+        
+        youtube.liveBroadcasts().transition(
+            broadcastStatus='complete',
             id=broadcast_id,
-            broadcastStatus='complete'
+            part='id,status'
         ).execute()
+        
         return True, "Broadcast stopped successfully"
+        
     except Exception as e:
-        return False, str(e)
+        return False, f"Error stopping broadcast: {str(e)}"
 
-def get_channel_info():
-    """Get YouTube channel information"""
-    service = get_youtube_service()
-    if not service:
-        return None
-    
+def upload_thumbnail(video_id, thumbnail_path):
+    """Upload thumbnail to YouTube video"""
     try:
-        response = service.channels().list(
-            part='snippet,statistics',
-            mine=True
+        youtube = get_youtube_service()
+        if not youtube:
+            return False, "YouTube service not available"
+        
+        if not os.path.exists(thumbnail_path):
+            return False, "Thumbnail file not found"
+        
+        youtube.thumbnails().set(
+            videoId=video_id,
+            media_body=MediaFileUpload(thumbnail_path)
         ).execute()
         
-        if response['items']:
-            channel = response['items'][0]
-            return {
-                'title': channel['snippet']['title'],
-                'subscriber_count': channel['statistics'].get('subscriberCount', 'Hidden'),
-                'view_count': channel['statistics'].get('viewCount', '0'),
-                'video_count': channel['statistics'].get('videoCount', '0')
-            }
+        return True, "Thumbnail uploaded successfully"
+        
+    except HttpError as e:
+        if e.resp.status == 429:
+            return False, "Rate limit exceeded. Please try again later."
+        error_details = e.error_details[0] if e.error_details else {}
+        return False, f"Failed to upload thumbnail: {error_details.get('message', str(e))}"
     except Exception as e:
-        st.error(f"Error getting channel info: {e}")
-    
-    return None
+        return False, f"Error uploading thumbnail: {str(e)}"
 
-def check_ffmpeg():
-    """Check if ffmpeg is installed and available"""
-    ffmpeg_path = shutil.which('ffmpeg')
-    if not ffmpeg_path:
-        st.error("FFmpeg is not installed or not in PATH. Please install FFmpeg to use this application.")
-        st.markdown("""
-        ### How to install FFmpeg:
-        
-        - **Ubuntu/Debian**: `sudo apt-get install ffmpeg`
-        - **Windows**: Download from [ffmpeg.org](https://ffmpeg.org/download.html) and add to PATH
-        - **macOS**: `brew install ffmpeg`
-        """)
-        return False
-    return True
+# Initialize session state
+if 'streams' not in st.session_state:
+    st.session_state.streams = pd.DataFrame(columns=[
+        'Video', 'Streaming Key', 'Jam Mulai', 'Status', 'PID', 'Is Shorts', 'Quality', 'Broadcast ID'
+    ])
 
-def is_process_running(pid):
-    """Check if a process with given PID is still running"""
+if 'processes' not in st.session_state:
+    st.session_state.processes = {}
+
+def save_persistent_streams(df):
+    """Save streams to persistent storage"""
     try:
-        if psutil.pid_exists(pid):
-            process = psutil.Process(pid)
-            if 'ffmpeg' in process.name().lower():
-                return True
-    except (psutil.NoSuchProcess, psutil.AccessDenied):
-        pass
-    return False
+        df.to_csv('persistent_streams.csv', index=False)
+    except Exception as e:
+        st.error(f"Error saving streams: {e}")
 
-def reconnect_to_existing_streams():
-    """Reconnect to streams that are still running after page refresh"""
-    active_streams = load_active_streams()
-    
-    pid_files = [f for f in os.listdir('.') if f.startswith('stream_') and f.endswith('.pid')]
-    
-    for pid_file in pid_files:
-        try:
-            row_id = int(pid_file.split('_')[1].split('.')[0])
-            
-            with open(pid_file, "r") as f:
-                pid = int(f.read().strip())
-            
-            if is_process_running(pid):
-                if row_id < len(st.session_state.streams):
-                    st.session_state.streams.loc[row_id, 'Status'] = 'Sedang Live'
-                    active_streams[str(row_id)] = {
-                        'pid': pid,
-                        'started_at': datetime.datetime.now().isoformat()
-                    }
-            else:
-                cleanup_stream_files(row_id)
-                if str(row_id) in active_streams:
-                    del active_streams[str(row_id)]
-                
-        except (ValueError, FileNotFoundError, IOError):
-            try:
-                os.remove(pid_file)
-            except:
-                pass
-    
-    save_active_streams(active_streams)
-
-def cleanup_stream_files(row_id):
-    """Clean up all files related to a stream"""
-    files_to_remove = [
-        f"stream_{row_id}.pid",
-        f"stream_{row_id}.status"
-    ]
-    
-    for file_name in files_to_remove:
-        try:
-            if os.path.exists(file_name):
-                os.remove(file_name)
-        except:
-            pass
-
-def get_quality_settings(quality, is_shorts=False):
-    """Get optimized encoding settings based on quality"""
-    settings = {
-        "720p": {
-            "video_bitrate": "2500k",
-            "audio_bitrate": "128k",
-            "maxrate": "2750k",
-            "bufsize": "5500k",
-            "scale": "1280:720" if not is_shorts else "720:1280",
-            "fps": "30"
-        },
-        "1080p": {
-            "video_bitrate": "4500k",
-            "audio_bitrate": "192k",
-            "maxrate": "4950k",
-            "bufsize": "9900k",
-            "scale": "1920:1080" if not is_shorts else "1080:1920",
-            "fps": "30"
-        },
-        "480p": {
-            "video_bitrate": "1000k",
-            "audio_bitrate": "96k",
-            "maxrate": "1100k",
-            "bufsize": "2200k",
-            "scale": "854:480" if not is_shorts else "480:854",
-            "fps": "30"
-        }
-    }
-    return settings.get(quality, settings["720p"])
-
-def run_ffmpeg(video_path, stream_key, is_shorts, row_id, quality="720p", broadcast_id=None):
-    """Stream a video file to RTMP server using ffmpeg with optimized settings"""
-    output_url = f"rtmp://a.rtmp.youtube.com/live2/{stream_key}"
-    
-    log_file = f"stream_{row_id}.log"
-    with open(log_file, "w") as f:
-        f.write(f"Starting optimized stream for {video_path} at {datetime.datetime.now()}\n")
-        f.write(f"Quality: {quality}, Shorts: {is_shorts}\n")
-        if broadcast_id:
-            f.write(f"Broadcast ID: {broadcast_id}\n")
-    
-    settings = get_quality_settings(quality, is_shorts)
-    
-    cmd = [
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel", "info",
-        "-re",
-        "-stream_loop", "-1",
-        "-i", video_path,
-        
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-tune", "zerolatency",
-        "-profile:v", "high",
-        "-level", "4.1",
-        "-pix_fmt", "yuv420p",
-        
-        "-b:v", settings["video_bitrate"],
-        "-maxrate", settings["maxrate"],
-        "-bufsize", settings["bufsize"],
-        "-minrate", str(int(settings["video_bitrate"].replace('k', '')) // 2) + "k",
-        
-        "-g", "60",
-        "-keyint_min", "30",
-        "-sc_threshold", "0",
-        
-        "-r", settings["fps"],
-        
-        "-c:a", "aac",
-        "-b:a", settings["audio_bitrate"],
-        "-ar", "44100",
-        "-ac", "2",
-        
-        "-vf", f"scale={settings['scale']}:force_original_aspect_ratio=decrease,pad={settings['scale']}:(ow-iw)/2:(oh-ih)/2,fps={settings['fps']}",
-        
-        "-f", "flv",
-        
-        "-reconnect", "1",
-        "-reconnect_streamed", "1",
-        "-reconnect_delay_max", "5",
-        
-        output_url
-    ]
-    
-    with open(log_file, "a") as f:
-        f.write(f"Running: {' '.join(cmd)}\n")
-    
+def load_persistent_streams():
+    """Load streams from persistent storage"""
     try:
-        if os.name == 'nt':
-            process = subprocess.Popen(
-                cmd, 
-                stdout=subprocess.PIPE, 
-                stderr=subprocess.STDOUT, 
-                text=True,
-                bufsize=1,
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
-            )
+        if os.path.exists('persistent_streams.csv'):
+            df = pd.read_csv('persistent_streams.csv')
+            # Ensure all required columns exist
+            required_columns = ['Video', 'Streaming Key', 'Jam Mulai', 'Status', 'PID', 'Is Shorts', 'Quality', 'Broadcast ID']
+            for col in required_columns:
+                if col not in df.columns:
+                    df[col] = '' if col in ['Video', 'Streaming Key', 'Jam Mulai', 'Status', 'Broadcast ID'] else False if col == 'Is Shorts' else '720p' if col == 'Quality' else 0
+            return df
         else:
-            process = subprocess.Popen(
-                cmd, 
-                stdout=subprocess.PIPE, 
-                stderr=subprocess.STDOUT, 
-                text=True,
-                bufsize=1,
-                preexec_fn=os.setsid
-            )
-        
-        with open(f"stream_{row_id}.pid", "w") as f:
-            f.write(str(process.pid))
-        
-        with open(f"stream_{row_id}.status", "w") as f:
-            f.write("streaming")
-        
-        active_streams = load_active_streams()
-        active_streams[str(row_id)] = {
-            'pid': process.pid,
-            'started_at': datetime.datetime.now().isoformat(),
-            'broadcast_id': broadcast_id
+            return pd.DataFrame(columns=['Video', 'Streaming Key', 'Jam Mulai', 'Status', 'PID', 'Is Shorts', 'Quality', 'Broadcast ID'])
+    except Exception as e:
+        st.error(f"Error loading streams: {e}")
+        return pd.DataFrame(columns=['Video', 'Streaming Key', 'Jam Mulai', 'Status', 'PID', 'Is Shorts', 'Quality', 'Broadcast ID'])
+
+# Load persistent streams on startup
+if st.session_state.streams.empty:
+    st.session_state.streams = load_persistent_streams()
+
+def run_ffmpeg(video_path, streaming_key, is_shorts=False, stream_index=None, quality='720p', broadcast_id=None):
+    """Run FFmpeg with proper YouTube streaming settings"""
+    try:
+        # Quality settings
+        quality_settings = {
+            '240p': {'resolution': '426x240', 'bitrate': '400k', 'fps': '24'},
+            '360p': {'resolution': '640x360', 'bitrate': '800k', 'fps': '24'},
+            '480p': {'resolution': '854x480', 'bitrate': '1200k', 'fps': '30'},
+            '720p': {'resolution': '1280x720', 'bitrate': '2500k', 'fps': '30'},
+            '1080p': {'resolution': '1920x1080', 'bitrate': '4500k', 'fps': '30'}
         }
-        save_active_streams(active_streams)
+        
+        settings = quality_settings.get(quality, quality_settings['720p'])
+        
+        # FFmpeg command for YouTube streaming
+        cmd = [
+            'ffmpeg',
+            '-re',  # Read input at native frame rate
+            '-i', video_path,
+            '-c:v', 'libx264',  # Video codec
+            '-preset', 'veryfast',  # Encoding speed
+            '-tune', 'zerolatency',  # Low latency
+            '-b:v', settings['bitrate'],  # Video bitrate
+            '-maxrate', settings['bitrate'],
+            '-bufsize', str(int(settings['bitrate'].replace('k', '')) * 2) + 'k',
+            '-s', settings['resolution'],  # Resolution
+            '-r', settings['fps'],  # Frame rate
+            '-g', '60',  # GOP size
+            '-keyint_min', '60',
+            '-sc_threshold', '0',
+            '-c:a', 'aac',  # Audio codec
+            '-b:a', '128k',  # Audio bitrate
+            '-ar', '44100',  # Audio sample rate
+            '-ac', '2',  # Audio channels
+            '-f', 'flv',  # Output format
+            f'rtmp://a.rtmp.youtube.com/live2/{streaming_key}'
+        ]
+        
+        # Start FFmpeg process
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True
+        )
+        
+        # Store process info
+        if stream_index is not None:
+            st.session_state.processes[stream_index] = process
+            st.session_state.streams.loc[stream_index, 'PID'] = process.pid
+            st.session_state.streams.loc[stream_index, 'Status'] = 'Sedang Live'
+            save_persistent_streams(st.session_state.streams)
         
         # Auto-start YouTube broadcast if broadcast_id is provided
         if broadcast_id:
-            time.sleep(5)  # Wait a bit for stream to establish
-            success, message = start_youtube_broadcast(broadcast_id)
-            with open(log_file, "a") as f:
-                f.write(f"YouTube broadcast start: {success} - {message}\n")
+            def start_broadcast_delayed():
+                time.sleep(8)  # Wait for stream to establish
+                success, message = start_youtube_broadcast(broadcast_id)
+                if success:
+                    print(f"✅ YouTube broadcast started: {message}")
+                else:
+                    print(f"❌ Failed to start YouTube broadcast: {message}")
+            
+            # Start broadcast in background thread
+            threading.Thread(target=start_broadcast_delayed, daemon=True).start()
         
-        def log_output():
+        # Monitor process
+        def monitor_process():
             try:
-                for line in process.stdout:
-                    with open(log_file, "a") as f:
-                        f.write(line)
-                    if "Connection refused" in line or "Server returned 4" in line:
-                        with open(f"stream_{row_id}.status", "w") as f:
-                            f.write("error: YouTube connection failed")
-            except:
-                pass
+                stdout, stderr = process.communicate()
+                if stream_index is not None and stream_index in st.session_state.processes:
+                    del st.session_state.processes[stream_index]
+                    st.session_state.streams.loc[stream_index, 'Status'] = 'Selesai'
+                    st.session_state.streams.loc[stream_index, 'PID'] = 0
+                    save_persistent_streams(st.session_state.streams)
+                    
+                    # Auto-stop YouTube broadcast
+                    if broadcast_id:
+                        stop_youtube_broadcast(broadcast_id)
+                        
+            except Exception as e:
+                print(f"Error monitoring process: {e}")
         
-        log_thread = threading.Thread(target=log_output, daemon=True)
-        log_thread.start()
-        
-        process.wait()
-        
-        with open(f"stream_{row_id}.status", "w") as f:
-            f.write("completed")
-        
-        with open(log_file, "a") as f:
-            f.write("Streaming completed.\n")
-        
-        # Auto-stop YouTube broadcast
-        if broadcast_id:
-            success, message = stop_youtube_broadcast(broadcast_id)
-            with open(log_file, "a") as f:
-                f.write(f"YouTube broadcast stop: {success} - {message}\n")
-        
-        active_streams = load_active_streams()
-        if str(row_id) in active_streams:
-            del active_streams[str(row_id)]
-        save_active_streams(active_streams)
-        
-    except Exception as e:
-        error_msg = f"Error: {str(e)}"
-        
-        with open(log_file, "a") as f:
-            f.write(f"{error_msg}\n")
-        
-        with open(f"stream_{row_id}.status", "w") as f:
-            f.write(f"error: {str(e)}")
-        
-        active_streams = load_active_streams()
-        if str(row_id) in active_streams:
-            del active_streams[str(row_id)]
-        save_active_streams(active_streams)
-    
-    finally:
-        with open(log_file, "a") as f:
-            f.write("Streaming finished or stopped.\n")
-        
-        cleanup_stream_files(row_id)
-
-def start_stream(video_path, stream_key, is_shorts, row_id, quality="720p", broadcast_id=None):
-    """Start a stream in a separate process"""
-    try:
-        st.session_state.streams.loc[row_id, 'Status'] = 'Sedang Live'
-        save_persistent_streams(st.session_state.streams)
-        
-        with open(f"stream_{row_id}.status", "w") as f:
-            f.write("starting")
-        
-        thread = threading.Thread(
-            target=run_ffmpeg,
-            args=(video_path, stream_key, is_shorts, row_id, quality, broadcast_id),
-            daemon=False
-        )
-        thread.start()
+        # Start monitoring in background thread
+        threading.Thread(target=monitor_process, daemon=True).start()
         
         return True
+        
     except Exception as e:
         st.error(f"Error starting stream: {e}")
         return False
 
-def stop_stream(row_id):
-    """Stop a running stream"""
+def start_stream(video_path, streaming_key, is_shorts=False, stream_index=None, quality='720p', broadcast_id=None):
+    """Start streaming with proper error handling"""
+    if not os.path.exists(video_path):
+        st.error(f"❌ Video file not found: {video_path}")
+        return False
+    
+    return run_ffmpeg(video_path, streaming_key, is_shorts, stream_index, quality, broadcast_id)
+
+def stop_stream(stream_index):
+    """Stop streaming process"""
     try:
-        active_streams = load_active_streams()
-        
-        pid = None
-        broadcast_id = None
-        if str(row_id) in active_streams:
-            pid = active_streams[str(row_id)]['pid']
-            broadcast_id = active_streams[str(row_id)].get('broadcast_id')
-        
-        if not pid and os.path.exists(f"stream_{row_id}.pid"):
-            with open(f"stream_{row_id}.pid", "r") as f:
-                pid = int(f.read().strip())
-        
-        if pid and is_process_running(pid):
-            try:
-                if os.name == 'nt':
-                    subprocess.run(['taskkill', '/F', '/PID', str(pid)], 
-                                 capture_output=True, check=False)
-                else:
-                    try:
-                        os.killpg(os.getpgid(pid), signal.SIGTERM)
-                        time.sleep(2)
-                        if is_process_running(pid):
-                            os.killpg(os.getpgid(pid), signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                
-                # Stop YouTube broadcast if broadcast_id exists
-                if broadcast_id:
-                    stop_youtube_broadcast(broadcast_id)
-                
-                st.session_state.streams.loc[row_id, 'Status'] = 'Dihentikan'
-                save_persistent_streams(st.session_state.streams)
-                
-                with open(f"stream_{row_id}.status", "w") as f:
-                    f.write("stopped")
-                
-                if str(row_id) in active_streams:
-                    del active_streams[str(row_id)]
-                save_active_streams(active_streams)
-                
-                cleanup_stream_files(row_id)
-                
-                return True
-                
-            except Exception as e:
-                st.error(f"Error stopping stream: {str(e)}")
-                return False
-        else:
-            st.session_state.streams.loc[row_id, 'Status'] = 'Dihentikan'
-            save_persistent_streams(st.session_state.streams)
-            cleanup_stream_files(row_id)
+        if stream_index in st.session_state.processes:
+            process = st.session_state.processes[stream_index]
             
-            if str(row_id) in active_streams:
-                del active_streams[str(row_id)]
-            save_active_streams(active_streams)
+            # Get broadcast ID for cleanup
+            broadcast_id = st.session_state.streams.loc[stream_index, 'Broadcast ID']
+            
+            # Terminate FFmpeg process
+            process.terminate()
+            time.sleep(2)
+            
+            if process.poll() is None:
+                process.kill()
+            
+            # Clean up
+            del st.session_state.processes[stream_index]
+            st.session_state.streams.loc[stream_index, 'Status'] = 'Dihentikan'
+            st.session_state.streams.loc[stream_index, 'PID'] = 0
+            save_persistent_streams(st.session_state.streams)
+            
+            # Stop YouTube broadcast
+            if broadcast_id and broadcast_id != '':
+                stop_youtube_broadcast(broadcast_id)
             
             return True
-            
     except Exception as e:
-        st.error(f"Error stopping stream: {str(e)}")
+        st.error(f"Error stopping stream: {e}")
         return False
 
-def check_stream_statuses():
-    """Check status files for all streams and update accordingly"""
-    active_streams = load_active_streams()
-    
-    for idx, row in st.session_state.streams.iterrows():
-        status_file = f"stream_{idx}.status"
-        
-        if str(idx) in active_streams:
-            pid = active_streams[str(idx)]['pid']
-            
-            if not is_process_running(pid):
-                if row['Status'] == 'Sedang Live':
-                    if os.path.exists(status_file):
-                        with open(status_file, "r") as f:
-                            status = f.read().strip()
-                        
-                        if status == "completed":
-                            st.session_state.streams.loc[idx, 'Status'] = 'Selesai'
-                        elif status.startswith("error:"):
-                            st.session_state.streams.loc[idx, 'Status'] = status
-                        else:
-                            st.session_state.streams.loc[idx, 'Status'] = 'Terputus'
-                        
-                        save_persistent_streams(st.session_state.streams)
-                        os.remove(status_file)
-                    
-                    del active_streams[str(idx)]
-                    save_active_streams(active_streams)
-                    cleanup_stream_files(idx)
-        
-        elif os.path.exists(status_file):
-            with open(status_file, "r") as f:
-                status = f.read().strip()
-            
-            if status == "completed" and row['Status'] == 'Sedang Live':
-                st.session_state.streams.loc[idx, 'Status'] = 'Selesai'
-                save_persistent_streams(st.session_state.streams)
-                os.remove(status_file)
-            
-            elif status.startswith("error:") and row['Status'] == 'Sedang Live':
-                st.session_state.streams.loc[idx, 'Status'] = status
-                save_persistent_streams(st.session_state.streams)
-                os.remove(status_file)
-
 def check_scheduled_streams():
-    """Check for streams that need to be started based on schedule"""
+    """Check and start scheduled streams"""
     jakarta_time = get_jakarta_time()
-    current_time = jakarta_time.strftime("%H:%M")
+    current_time = format_jakarta_time(jakarta_time)
     
     for idx, row in st.session_state.streams.iterrows():
         if row['Status'] == 'Menunggu':
-            # Check if it's time to start (within 1 minute window)
             start_time = row['Jam Mulai']
             
             # Handle "NOW" case - start immediately
@@ -855,595 +468,364 @@ def check_scheduled_streams():
                 if start_stream(row['Video'], row['Streaming Key'], row.get('Is Shorts', False), idx, quality, broadcast_id):
                     st.session_state.streams.loc[idx, 'Jam Mulai'] = current_time
                     save_persistent_streams(st.session_state.streams)
+                continue
             
             # Handle scheduled time
-            elif start_time == current_time:
-                quality = row.get('Quality', '720p')
-                broadcast_id = row.get('Broadcast ID', None)
-                start_stream(row['Video'], row['Streaming Key'], row.get('Is Shorts', False), idx, quality, broadcast_id)
+            try:
+                # Parse scheduled time
+                scheduled_parts = start_time.replace(' WIB', '').split(':')
+                scheduled_hour = int(scheduled_parts[0])
+                scheduled_minute = int(scheduled_parts[1])
+                
+                # Current time
+                current_hour = jakarta_time.hour
+                current_minute = jakarta_time.minute
+                
+                # Check if it's time to start
+                if (current_hour > scheduled_hour or 
+                    (current_hour == scheduled_hour and current_minute >= scheduled_minute)):
+                    
+                    quality = row.get('Quality', '720p')
+                    broadcast_id = row.get('Broadcast ID', None)
+                    if start_stream(row['Video'], row['Streaming Key'], row.get('Is Shorts', False), idx, quality, broadcast_id):
+                        st.session_state.streams.loc[idx, 'Jam Mulai'] = current_time
+                        save_persistent_streams(st.session_state.streams)
+                        
+            except Exception as e:
+                st.error(f"Error processing scheduled stream: {e}")
 
-def get_stream_logs(row_id, max_lines=100):
-    """Get logs for a specific stream"""
-    log_file = f"stream_{row_id}.log"
-    if os.path.exists(log_file):
-        with open(log_file, "r") as f:
-            lines = f.readlines()
-        return lines[-max_lines:] if len(lines) > max_lines else lines
-    return []
+def get_video_files():
+    """Get list of video files from current directory"""
+    video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv', '.webm']
+    video_files = []
+    
+    try:
+        for file in os.listdir('.'):
+            if any(file.lower().endswith(ext) for ext in video_extensions):
+                video_files.append(file)
+    except Exception as e:
+        st.error(f"Error reading video files: {e}")
+    
+    return sorted(video_files)
 
-def main():
-    st.set_page_config(
-        page_title="Live Streaming Scheduler - YouTube Optimized",
-        page_icon="📺",
-        layout="wide"
-    )
-    
-    st.title("🎥 Live Streaming Scheduler - YouTube Optimized")
-    
-    # Handle OAuth callback first
-    handle_oauth_callback()
-    
-    # Check if ffmpeg is installed
-    if not check_ffmpeg():
-        return
-    
-    # Initialize session state with persistent data
-    if 'streams' not in st.session_state:
-        st.session_state.streams = load_persistent_streams()
-    
-    # Initialize YouTube authentication state
-    if 'youtube_authenticated' not in st.session_state:
-        credentials = load_youtube_credentials()
-        st.session_state.youtube_authenticated = credentials is not None
-        if credentials:
-            st.session_state.youtube_credentials = credentials
-    
-    # Reconnect to existing streams after page refresh
-    reconnect_to_existing_streams()
-    
-    # Sidebar for ads and info
-    show_ads = st.sidebar.checkbox("Tampilkan Iklan", value=False)
-    if show_ads:
-        st.sidebar.subheader("Iklan Sponsor")
-        components.html(
-            """
-            <div style="background:#f0f2f6;padding:20px;border-radius:10px;text-align:center">
-                <script type='text/javascript' 
-                        src='//pl26562103.profitableratecpm.com/28/f9/95/28f9954a1d5bbf4924abe123c76a68d2.js'>
-                </script>
-                <p style="color:#888">Iklan akan muncul di sini</p>
-            </div>
-            """,
-            height=300
-        )
-    
-    # Show Jakarta time in sidebar
-    jakarta_time = get_jakarta_time()
-    st.sidebar.markdown("### 🕐 Waktu Jakarta")
-    st.sidebar.info(f"**{jakarta_time.strftime('%H:%M:%S')} WIB**")
-    st.sidebar.caption(f"📅 {jakarta_time.strftime('%d %B %Y')}")
-    
-    # Show thumbnail quota in sidebar
-    can_upload, daily_count, hourly_count = can_upload_thumbnail()
-    st.sidebar.markdown("### 📸 Thumbnail Upload Status")
-    if can_upload:
-        st.sidebar.success(f"✅ Upload quota available")
-    else:
-        st.sidebar.error(f"❌ Upload quota exceeded")
-    st.sidebar.caption(f"Today: {daily_count}/50 uploads")
-    st.sidebar.caption(f"Last Hour: {hourly_count}/10 uploads")
-    
-    # Check status of running streams
-    check_stream_statuses()
-    
-    # Check for scheduled streams (including NOW streams)
-    check_scheduled_streams()
-    
-    # Auto-refresh controls
-    if st.sidebar.button("🔄 Refresh Status"):
-        st.rerun()
-    
-    # Show persistent stream info
-    active_streams = load_active_streams()
-    if active_streams:
-        st.sidebar.success(f"🟢 {len(active_streams)} stream(s) berjalan")
-    else:
-        st.sidebar.info("⚫ Tidak ada stream aktif")
-    
-    # YouTube authentication status
-    if st.session_state.youtube_authenticated:
-        channel_info = get_channel_info()
-        if channel_info:
-            st.sidebar.success(f"✅ YouTube: {channel_info['title']}")
-            st.sidebar.caption(f"👥 {channel_info['subscriber_count']} subscribers")
+def calculate_time_difference(target_time_str):
+    """Calculate time difference for display"""
+    try:
+        if target_time_str == "NOW":
+            return "Starting now..."
+        
+        jakarta_time = get_jakarta_time()
+        
+        # Parse target time
+        time_parts = target_time_str.replace(' WIB', '').split(':')
+        target_hour = int(time_parts[0])
+        target_minute = int(time_parts[1])
+        
+        # Create target datetime for today
+        target_time = jakarta_time.replace(hour=target_hour, minute=target_minute, second=0, microsecond=0)
+        
+        # If target time has passed today, it's for tomorrow
+        if target_time <= jakarta_time:
+            target_time += datetime.timedelta(days=1)
+        
+        # Calculate difference
+        time_diff = target_time - jakarta_time
+        
+        if time_diff.total_seconds() < 60:
+            return "Starting soon..."
+        elif time_diff.total_seconds() < 3600:
+            minutes = int(time_diff.total_seconds() / 60)
+            return f"Will start in {minutes} minutes"
         else:
-            st.sidebar.success("✅ YouTube: Connected")
-    else:
-        st.sidebar.warning("⚠️ YouTube: Not connected")
+            hours = int(time_diff.total_seconds() / 3600)
+            minutes = int((time_diff.total_seconds() % 3600) / 60)
+            return f"Will start in {hours}h {minutes}m"
+            
+    except Exception:
+        return "Time calculation error"
+
+# Streamlit UI
+st.set_page_config(page_title="🎬 YouTube Live Stream Manager", layout="wide")
+
+st.title("🎬 YouTube Live Stream Manager")
+st.markdown("---")
+
+# Auto-refresh for scheduled streams
+check_scheduled_streams()
+
+# Sidebar for YouTube Broadcast Creation
+with st.sidebar:
+    st.header("📺 Create YouTube Broadcast")
     
-    # Create tabs for different sections
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["Stream Manager", "Add New Stream", "YouTube API", "Logs", "Settings"])
-    
-    with tab1:
-        st.subheader("Manage Streams")
+    with st.form("broadcast_form"):
+        title = st.text_input("🎬 Broadcast Title", value="Live Stream")
+        description = st.text_area("📝 Description", value="Live streaming content")
         
-        st.caption("✅ Status akan diperbarui otomatis. Streaming akan tetap berjalan meski halaman di-refresh.")
-        st.caption("🎯 Optimized untuk YouTube Live dengan pengaturan encoding terbaik")
-        st.caption("🚀 Stream dengan waktu 'NOW' akan langsung tayang di YouTube")
+        # Privacy settings
+        privacy = st.selectbox("🔒 Privacy", ['public', 'unlisted', 'private'], index=0)
         
-        if not st.session_state.streams.empty:
-            # Display streams in card format
-            for i, row in st.session_state.streams.iterrows():
-                with st.container():
-                    col1, col2, col3, col4 = st.columns([3, 2, 2, 2])
-                    
-                    with col1:
-                        st.markdown(f"**📹 {os.path.basename(row['Video'])}**")
-                        st.caption(f"Duration: {row['Durasi']} | Quality: {row.get('Quality', '720p')}")
-                        if row.get('Is Shorts', False):
-                            st.caption("📱 YouTube Shorts Mode")
-                    
-                    with col2:
-                        start_time = row['Jam Mulai']
-                        if start_time == "NOW":
-                            st.markdown("🚀 **Start NOW**")
-                        else:
-                            st.markdown(f"⏰ **{start_time} WIB**")
-                            # Calculate time until start
-                            try:
-                                current_time = get_jakarta_time()
-                                start_datetime = datetime.datetime.combine(
-                                    current_time.date(),
-                                    datetime.datetime.strptime(start_time, "%H:%M").time()
-                                )
-                                start_datetime = jakarta_time.timezone.localize(start_datetime)
-                                
-                                if start_datetime < current_time:
-                                    start_datetime += datetime.timedelta(days=1)
-                                
-                                time_diff = start_datetime - current_time
-                                hours, remainder = divmod(time_diff.seconds, 3600)
-                                minutes, _ = divmod(remainder, 60)
-                                
-                                if time_diff.days > 0:
-                                    st.caption(f"Will start in {time_diff.days}d {hours}h {minutes}m")
-                                else:
-                                    st.caption(f"Will start in {hours}h {minutes}m")
-                            except:
-                                pass
-                    
-                    with col3:
-                        status = row['Status']
-                        if status == 'Sedang Live':
-                            st.markdown(f"🟢 **{status}**")
-                            if row.get('Watch URL'):
-                                st.markdown(f"[🔗 Watch on YouTube]({row['Watch URL']})")
-                        elif status == 'Menunggu':
-                            st.markdown(f"🟡 **{status}**")
-                        elif status == 'Selesai':
-                            st.markdown(f"🔵 **{status}**")
-                        elif status == 'Dihentikan':
-                            st.markdown(f"🟠 **{status}**")
-                        elif status.startswith('error:'):
-                            st.markdown(f"🔴 **Error**")
-                            st.caption(status.replace('error: ', ''))
-                        else:
-                            st.write(status)
-                        
-                        # Show masked streaming key
-                        masked_key = row['Streaming Key'][:4] + "****" if len(row['Streaming Key']) > 4 else "****"
-                        st.caption(f"Key: {masked_key}")
-                    
-                    with col4:
-                        if row['Status'] == 'Menunggu':
-                            if st.button("▶️ Start Stream", key=f"start_{i}"):
-                                quality = row.get('Quality', '720p')
-                                broadcast_id = row.get('Broadcast ID', None)
-                                if start_stream(row['Video'], row['Streaming Key'], row.get('Is Shorts', False), i, quality, broadcast_id):
-                                    st.rerun()
-                        
-                        elif row['Status'] == 'Sedang Live':
-                            if st.button("⏹️ Stop Stream", key=f"stop_{i}"):
-                                if stop_stream(i):
-                                    st.rerun()
-                        
-                        elif row['Status'] in ['Selesai', 'Dihentikan', 'Terputus'] or row['Status'].startswith('error:'):
-                            if st.button("🗑️ Remove", key=f"remove_{i}"):
-                                st.session_state.streams = st.session_state.streams.drop(i).reset_index(drop=True)
-                                save_persistent_streams(st.session_state.streams)
-                                log_file = f"stream_{i}.log"
-                                if os.path.exists(log_file):
-                                    os.remove(log_file)
-                                st.rerun()
-                    
-                    st.divider()
-        else:
-            st.info("No streams added yet. Use the 'Add New Stream' tab to add a stream.")
-    
-    with tab2:
-        st.subheader("Add New Stream")
+        # Time selection with Jakarta timezone
+        jakarta_time = get_jakarta_time()
+        current_time_str = format_jakarta_time(jakarta_time)
         
-        video_files = [f for f in os.listdir('.') if f.endswith(('.mp4', '.flv', '.avi', '.mov', '.mkv'))]
+        st.write(f"🕐 Current Time: **{current_time_str}**")
         
-        col1, col2 = st.columns(2)
+        # Quick time buttons
+        col1, col2, col3, col4 = st.columns(4)
+        
+        start_immediately = False
+        broadcast_time = None
         
         with col1:
-            st.write("**📹 Select Video:**")
-            selected_video = st.selectbox("Choose from uploaded videos", [""] + video_files) if video_files else None
-            
-            uploaded_file = st.file_uploader("Or upload new video", type=['mp4', 'flv', 'avi', 'mov', 'mkv'])
-            
-            if uploaded_file:
-                with open(uploaded_file.name, "wb") as f:
-                    f.write(uploaded_file.getbuffer())
-                st.success("✅ Video uploaded successfully!")
-                video_path = uploaded_file.name
-            elif selected_video:
-                video_path = selected_video
-            else:
-                video_path = None
+            if st.form_submit_button("🚀 NOW"):
+                broadcast_time = jakarta_time.time()
+                start_immediately = True
         
         with col2:
-            st.write("**⚙️ Stream Settings:**")
-            stream_key = st.text_input("Stream Key", type="password")
-            
-            # Time selection with Jakarta timezone
-            jakarta_time = get_jakarta_time()
-            
-            col2a, col2b = st.columns(2)
-            with col2a:
-                if st.button("🚀 Start NOW"):
-                    start_time_str = "NOW"
-                    st.success("✅ Set to start immediately")
-                else:
-                    start_time_str = None
-            
-            with col2b:
-                if st.button("⏰ +5 min"):
-                    future_time = jakarta_time + datetime.timedelta(minutes=5)
-                    start_time_str = future_time.strftime("%H:%M")
-                    st.success(f"✅ Set to {start_time_str} WIB")
-                elif st.button("⏰ +15 min"):
-                    future_time = jakarta_time + datetime.timedelta(minutes=15)
-                    start_time_str = future_time.strftime("%H:%M")
-                    st.success(f"✅ Set to {start_time_str} WIB")
-                elif st.button("⏰ +30 min"):
-                    future_time = jakarta_time + datetime.timedelta(minutes=30)
-                    start_time_str = future_time.strftime("%H:%M")
-                    st.success(f"✅ Set to {start_time_str} WIB")
-            
-            if not start_time_str:
-                start_time = st.time_input("Custom start time", value=jakarta_time.time())
-                start_time_str = start_time.strftime("%H:%M")
-            
-            duration = st.text_input("Duration (HH:MM:SS)", value="01:00:00")
-            
-            quality = st.selectbox("Quality", ["480p", "720p", "1080p"], index=1)
-            
-            is_shorts = st.checkbox("📱 YouTube Shorts Mode (Vertical)")
+            if st.form_submit_button("⏰ +5min"):
+                future_time = jakarta_time + datetime.timedelta(minutes=5)
+                broadcast_time = future_time.time()
         
-        if st.button("➕ Add Stream"):
-            if video_path and stream_key:
-                video_filename = os.path.basename(video_path)
+        with col3:
+            if st.form_submit_button("⏰ +15min"):
+                future_time = jakarta_time + datetime.timedelta(minutes=15)
+                broadcast_time = future_time.time()
+        
+        with col4:
+            if st.form_submit_button("⏰ +30min"):
+                future_time = jakarta_time + datetime.timedelta(minutes=30)
+                broadcast_time = future_time.time()
+        
+        # Manual time input
+        if not broadcast_time:
+            manual_time = st.time_input("🕐 Or set custom time", value=jakarta_time.time())
+            if st.form_submit_button("📅 Schedule"):
+                broadcast_time = manual_time
+        
+        # Process broadcast creation
+        if broadcast_time:
+            with st.spinner("Creating YouTube broadcast..."):
+                # Format time for API
+                if start_immediately:
+                    time_str = "NOW"
+                else:
+                    time_str = broadcast_time.strftime('%H:%M')
                 
+                # Create broadcast
+                broadcast_id, stream_key, error = create_youtube_broadcast(
+                    title, description, time_str, privacy
+                )
+                
+                if error:
+                    st.error(f"❌ {error}")
+                else:
+                    st.success(f"✅ Broadcast created successfully!")
+                    st.info(f"🔑 Stream Key: `{stream_key}`")
+                    st.info(f"🆔 Broadcast ID: `{broadcast_id}`")
+                    
+                    # Auto-add to stream manager
+                    video_files = get_video_files()
+                    if video_files:
+                        selected_video = st.selectbox("📹 Select video to stream", video_files)
+                        quality = st.selectbox("🎥 Quality", ['240p', '360p', '480p', '720p', '1080p'], index=3)
+                        is_shorts = st.checkbox("📱 YouTube Shorts format")
+                        
+                        if st.button("➕ Add to Stream Manager"):
+                            # Add to streams
+                            new_stream = pd.DataFrame({
+                                'Video': [selected_video],
+                                'Streaming Key': [stream_key],
+                                'Jam Mulai': [time_str],
+                                'Status': ['Menunggu'],
+                                'PID': [0],
+                                'Is Shorts': [is_shorts],
+                                'Quality': [quality],
+                                'Broadcast ID': [broadcast_id]
+                            })
+                            
+                            st.session_state.streams = pd.concat([st.session_state.streams, new_stream], ignore_index=True)
+                            save_persistent_streams(st.session_state.streams)
+                            st.success("✅ Stream added to manager!")
+                            st.rerun()
+
+# Main content area
+col1, col2 = st.columns([2, 1])
+
+with col1:
+    st.header("📋 Stream Manager")
+    
+    # Add new stream form
+    with st.expander("➕ Add New Stream", expanded=False):
+        with st.form("add_stream"):
+            video_files = get_video_files()
+            
+            if not video_files:
+                st.warning("⚠️ No video files found in current directory")
+                st.stop()
+            
+            selected_video = st.selectbox("📹 Select Video", video_files)
+            streaming_key = st.text_input("🔑 Streaming Key", help="Your YouTube streaming key")
+            
+            # Time input with Jakarta timezone
+            jakarta_time = get_jakarta_time()
+            current_time_str = format_jakarta_time(jakarta_time)
+            
+            st.write(f"🕐 Current Time: **{current_time_str}**")
+            
+            # Quick time selection
+            col_now, col_5, col_15, col_30 = st.columns(4)
+            
+            schedule_time = None
+            
+            with col_now:
+                if st.form_submit_button("🚀 NOW"):
+                    schedule_time = "NOW"
+            
+            with col_5:
+                if st.form_submit_button("⏰ +5min"):
+                    future_time = jakarta_time + datetime.timedelta(minutes=5)
+                    schedule_time = format_jakarta_time(future_time)
+            
+            with col_15:
+                if st.form_submit_button("⏰ +15min"):
+                    future_time = jakarta_time + datetime.timedelta(minutes=15)
+                    schedule_time = format_jakarta_time(future_time)
+            
+            with col_30:
+                if st.form_submit_button("⏰ +30min"):
+                    future_time = jakarta_time + datetime.timedelta(minutes=30)
+                    schedule_time = format_jakarta_time(future_time)
+            
+            # Manual time input
+            if not schedule_time:
+                manual_time = st.time_input("🕐 Or set custom time", value=jakarta_time.time())
+                quality = st.selectbox("🎥 Quality", ['240p', '360p', '480p', '720p', '1080p'], index=3)
+                is_shorts = st.checkbox("📱 YouTube Shorts format")
+                
+                if st.form_submit_button("📅 Add Stream"):
+                    schedule_time = format_jakarta_time(
+                        jakarta_time.replace(hour=manual_time.hour, minute=manual_time.minute, second=0, microsecond=0)
+                    )
+            
+            # Process stream addition
+            if schedule_time and streaming_key:
                 new_stream = pd.DataFrame({
-                    'Video': [video_path],
-                    'Durasi': [duration],
-                    'Jam Mulai': [start_time_str],
-                    'Streaming Key': [stream_key],
+                    'Video': [selected_video],
+                    'Streaming Key': [streaming_key],
+                    'Jam Mulai': [schedule_time],
                     'Status': ['Menunggu'],
-                    'Is Shorts': [is_shorts],
-                    'Quality': [quality],
-                    'Broadcast ID': [None],
-                    'Watch URL': [None]
+                    'PID': [0],
+                    'Is Shorts': [is_shorts if 'is_shorts' in locals() else False],
+                    'Quality': [quality if 'quality' in locals() else '720p'],
+                    'Broadcast ID': ['']
                 })
                 
                 st.session_state.streams = pd.concat([st.session_state.streams, new_stream], ignore_index=True)
                 save_persistent_streams(st.session_state.streams)
-                
-                if start_time_str == "NOW":
-                    st.success(f"✅ Added stream for {video_filename} - Will start immediately!")
-                else:
-                    st.success(f"✅ Added stream for {video_filename} - Scheduled for {start_time_str} WIB")
-                
+                st.success("✅ Stream added successfully!")
                 st.rerun()
-            else:
-                if not video_path:
-                    st.error("❌ Please select or upload a video")
-                if not stream_key:
-                    st.error("❌ Please provide a streaming key")
-    
-    with tab3:
-        st.subheader("🔴 YouTube API Integration")
-        
-        if not st.session_state.youtube_authenticated:
-            st.warning("⚠️ YouTube API not connected. Connect to enable automatic broadcast creation.")
-            
-            with st.expander("🔧 Setup YouTube API", expanded=True):
-                st.markdown("""
-                ### 📋 Setup Instructions:
-                
-                1. **Go to [Google Cloud Console](https://console.cloud.google.com)**
-                2. **Create a new project** or select existing one
-                3. **Enable "YouTube Data API v3"**
-                4. **Create OAuth 2.0 Client ID:**
-                   - Application type: **Web application**
-                   - Authorized redirect URIs: `https://liveyt4.streamlit.app`
-                5. **Copy Client ID and Client Secret**
-                """)
-                
-                col1, col2 = st.columns(2)
-                with col1:
-                    client_id = st.text_input("Client ID", key="client_id_input")
-                with col2:
-                    client_secret = st.text_input("Client Secret", type="password", key="client_secret_input")
-                
-                if st.button("💾 Save Credentials"):
-                    if client_id and client_secret:
-                        st.session_state.client_id = client_id
-                        st.session_state.client_secret = client_secret
-                        st.success("✅ Credentials saved! Now click 'Start Authentication' below.")
-                    else:
-                        st.error("Please enter both Client ID and Client Secret")
-                
-                if st.button("🔐 Start Authentication"):
-                    authenticate_youtube_manual()
-        
-        else:
-            st.success("✅ YouTube API Connected!")
-            
-            # Show channel info
-            channel_info = get_channel_info()
-            if channel_info:
-                col1, col2, col3, col4 = st.columns(4)
-                col1.metric("Channel", channel_info['title'])
-                col2.metric("Subscribers", channel_info['subscriber_count'])
-                col3.metric("Total Views", channel_info['view_count'])
-                col4.metric("Videos", channel_info['video_count'])
-            
-            st.subheader("🎬 Create YouTube Live Broadcast")
-            
-            with st.form("create_broadcast"):
-                broadcast_title = st.text_input("Broadcast Title", value="Live Stream")
-                broadcast_description = st.text_area("Description", value="Live streaming with automated scheduler")
-                
-                # Video selection for auto-add to stream manager
-                video_files = [f for f in os.listdir('.') if f.endswith(('.mp4', '.flv', '.avi', '.mov', '.mkv'))]
-                selected_video_for_broadcast = st.selectbox("Select video for this broadcast", [""] + video_files)
-                
-                col1, col2 = st.columns(2)
-                with col1:
-                    broadcast_date = st.date_input("Date", value=datetime.date.today())
-                with col2:
-                    jakarta_time = get_jakarta_time()
-                    
-                    # Quick time buttons
-                    time_col1, time_col2, time_col3, time_col4 = st.columns(4)
-                    with time_col1:
-                        if st.form_submit_button("🚀 NOW"):
-                            broadcast_time = jakarta_time.time()
-                            start_immediately = True
-                    with time_col2:
-                        if st.form_submit_button("⏰ +5min"):
-                            future_time = jakarta_time + datetime.timedelta(minutes=5)
-                            broadcast_time = future_time.time()
-                            start_immediately = False
-                    with time_col3:
-                        if st.form_submit_button("⏰ +15min"):
-                            future_time = jakarta_time + datetime.timedelta(minutes=15)
-                            broadcast_time = future_time.time()
-                            start_immediately = False
-                    with time_col4:
-                        if st.form_submit_button("⏰ +30min"):
-                            future_time = jakarta_time + datetime.timedelta(minutes=30)
-                            broadcast_time = future_time.time()
-                            start_immediately = False
-                    
-                    # Default time input
-                    if 'start_immediately' not in locals():
-                        broadcast_time = st.time_input("Custom Time", value=jakarta_time.time())
-                        start_immediately = False
-                
-                col3, col4 = st.columns(2)
-                with col3:
-                    privacy_status = st.selectbox("Privacy", ["unlisted", "public", "private"], index=0)
-                with col4:
-                    quality = st.selectbox("Stream Quality", ["480p", "720p", "1080p"], index=1)
-                
-                # Thumbnail upload
-                thumbnail_file = st.file_uploader("Upload Thumbnail (Optional)", type=['jpg', 'jpeg', 'png'])
-                
-                if st.form_submit_button("🔴 Create Broadcast") or 'start_immediately' in locals():
-                    if broadcast_title:
-                        # Combine date and time
-                        start_datetime = datetime.datetime.combine(broadcast_date, broadcast_time)
-                        
-                        with st.spinner("Creating YouTube Live broadcast..."):
-                            broadcast_info, error = create_youtube_broadcast(
-                                broadcast_title, 
-                                broadcast_description, 
-                                start_datetime, 
-                                privacy_status,
-                                quality,
-                                thumbnail_file
-                            )
-                        
-                        if broadcast_info:
-                            st.success("✅ Broadcast created successfully!")
-                            
-                            col1, col2 = st.columns(2)
-                            with col1:
-                                st.info(f"**Stream Key:** `{broadcast_info['stream_key']}`")
-                                st.info(f"**Broadcast ID:** `{broadcast_info['broadcast_id']}`")
-                            with col2:
-                                st.info(f"**Watch URL:** {broadcast_info['watch_url']}")
-                                st.markdown(f"[🔗 Open YouTube Live]({broadcast_info['watch_url']})")
-                            
-                            # Auto-add to streams with video if selected
-                            if selected_video_for_broadcast:
-                                time_str = "NOW" if 'start_immediately' in locals() and start_immediately else broadcast_time.strftime("%H:%M")
-                                
-                                new_stream = pd.DataFrame({
-                                    'Video': [selected_video_for_broadcast],
-                                    'Durasi': ['01:00:00'],
-                                    'Jam Mulai': [time_str],
-                                    'Streaming Key': [broadcast_info['stream_key']],
-                                    'Status': ['Menunggu'],
-                                    'Is Shorts': [False],
-                                    'Quality': [quality],
-                                    'Broadcast ID': [broadcast_info['broadcast_id']],
-                                    'Watch URL': [broadcast_info['watch_url']]
-                                })
-                                
-                                st.session_state.streams = pd.concat([st.session_state.streams, new_stream], ignore_index=True)
-                                save_persistent_streams(st.session_state.streams)
-                                
-                                if time_str == "NOW":
-                                    st.success("✅ Added to Stream Manager and will start immediately!")
-                                else:
-                                    st.success(f"✅ Added to Stream Manager for {time_str} WIB!")
-                                
-                                st.rerun()
-                            else:
-                                st.info("💡 Select a video above to automatically add this broadcast to Stream Manager")
-                        else:
-                            st.error(f"❌ Error creating broadcast: {error}")
-                    else:
-                        st.error("Please enter a broadcast title")
-            
-            # Disconnect option
-            if st.button("🔌 Disconnect YouTube API"):
-                if os.path.exists(YOUTUBE_CREDENTIALS_FILE):
-                    os.remove(YOUTUBE_CREDENTIALS_FILE)
-                st.session_state.youtube_authenticated = False
-                if 'youtube_credentials' in st.session_state:
-                    del st.session_state.youtube_credentials
-                st.success("✅ Disconnected from YouTube API")
-                st.rerun()
-    
-    with tab4:
-        st.subheader("📊 Stream Logs")
-        
-        log_files = [f for f in os.listdir('.') if f.startswith('stream_') and f.endswith('.log')]
-        stream_ids = [int(f.split('_')[1].split('.')[0]) for f in log_files]
-        
-        if stream_ids:
-            stream_options = {}
-            for idx in stream_ids:
-                if idx in st.session_state.streams.index:
-                    video_name = os.path.basename(st.session_state.streams.loc[idx, 'Video'])
-                    stream_options[f"{video_name} (ID: {idx})"] = idx
-            
-            if stream_options:
-                selected_stream = st.selectbox("Select stream to view logs", options=list(stream_options.keys()))
-                selected_id = stream_options[selected_stream]
-                
-                logs = get_stream_logs(selected_id)
-                log_container = st.container()
-                with log_container:
-                    st.code("".join(logs))
-                
-                auto_refresh = st.checkbox("Auto-refresh logs", value=False)
-                if auto_refresh:
-                    time.sleep(3)
-                    st.rerun()
-            else:
-                st.info("No logs available. Start a stream to see logs.")
-        else:
-            st.info("No logs available. Start a stream to see logs.")
-    
-    with tab5:
-        st.subheader("⚙️ Streaming Settings & Tips")
-        
-        st.markdown("""
-        ### 🎯 New Features:
-        
-        ✅ **Instant Live Streaming**: Click "NOW" to go live immediately  
-        ✅ **Auto YouTube Broadcast**: Automatic broadcast start/stop  
-        ✅ **Jakarta Timezone**: All times in WIB (Asia/Jakarta)  
-        ✅ **Smart Thumbnail Upload**: Rate limit protection  
-        ✅ **Enhanced Stream Management**: Better UI and controls  
-        
-        ### 🚀 Quick Start Guide:
-        
-        1. **Connect YouTube API** (optional but recommended)
-        2. **Create Broadcast** with "NOW" button for instant streaming
-        3. **Select Video** to auto-add to Stream Manager
-        4. **Stream starts immediately** and goes live on YouTube
-        
-        ### 📊 Quality Settings:
-        
-        - **480p**: 1000k video bitrate, 96k audio - untuk koneksi lambat
-        - **720p**: 2500k video bitrate, 128k audio - recommended
-        - **1080p**: 4500k video bitrate, 192k audio - untuk koneksi cepat
-        
-        ### 🔧 Troubleshooting:
-        
-        **Jika stream tidak langsung tayang:**
-        1. Pastikan YouTube API terkoneksi
-        2. Gunakan "NOW" button untuk instant streaming
-        3. Check logs untuk error messages
-        4. Pastikan video file valid dan accessible
-        
-        **Untuk YouTube Shorts:**
-        - Video akan otomatis di-scale ke aspect ratio vertikal
-        - Gunakan video dengan resolusi 9:16 untuk hasil terbaik
-        
-        **YouTube API Features:**
-        - Auto-create live broadcasts
-        - Instant streaming dengan "NOW" button
-        - Auto start/stop broadcasts
-        - Thumbnail upload dengan rate limiting
-        - Channel analytics integration
-        """)
-        
-        st.subheader("🌐 Network Test")
-        if st.button("Test Upload Speed"):
-            st.info("Untuk test upload speed yang akurat, gunakan speedtest.net")
-            st.markdown("[🔗 Test Speed di Speedtest.net](https://speedtest.net)")
-    
-    # Instructions
-    with st.sidebar.expander("📖 How to use"):
-        st.markdown("""
-        ### Quick Start:
-        
-        1. **🔴 YouTube API** (Recommended):
-           - Connect your YouTube channel
-           - Create broadcast with "NOW" button
-           - Stream goes live immediately!
-        
-        2. **📹 Manual Setup**: 
-           - Upload/select video
-           - Enter stream key
-           - Click "Start NOW" for instant streaming
-        
-        3. **⚙️ Advanced**:
-           - Schedule streams for later
-           - Use different quality settings
-           - Monitor with real-time logs
-        
-        ### 🚀 NEW: Instant Streaming
-        
-        - **"NOW" Button**: Stream langsung tayang
-        - **Auto YouTube**: Broadcast otomatis start
-        - **Jakarta Time**: Semua waktu dalam WIB
-        - **Smart Upload**: Thumbnail dengan rate limiting
-        
-        ### Requirements:
-        
-        - FFmpeg must be installed
-        - Compatible video formats (MP4 recommended)
-        - Stable internet (upload speed 3x bitrate)
-        - YouTube API credentials (recommended)
-        
-        ### Quality Recommendations:
-        
-        - **480p**: Upload speed minimal 3 Mbps
-        - **720p**: Upload speed minimal 8 Mbps  
-        - **1080p**: Upload speed minimal 15 Mbps
-        """)
-    
-    time.sleep(1)
 
-if __name__ == '__main__':
-    main()
+    # Display streams
+    if not st.session_state.streams.empty:
+        st.subheader("📺 Active Streams")
+        
+        for idx, row in st.session_state.streams.iterrows():
+            with st.container():
+                # Create card-like layout
+                card_col1, card_col2, card_col3, card_col4 = st.columns([3, 2, 2, 2])
+                
+                with card_col1:
+                    st.write(f"**📹 {row['Video']}**")
+                    st.caption(f"Duration: 01:00:00 | Quality: {row.get('Quality', '720p')}")
+                    
+                    # YouTube link if broadcast ID exists
+                    if row.get('Broadcast ID') and row['Broadcast ID'] != '':
+                        youtube_url = f"https://youtube.com/watch?v={row['Broadcast ID']}"
+                        st.markdown(f"🔗 [Watch on YouTube]({youtube_url})")
+                    
+                    st.caption(f"Key: {row['Streaming Key'][:8]}****")
+                
+                with card_col2:
+                    # Time display with countdown
+                    st.write(f"🕐 **{row['Jam Mulai']}**")
+                    if row['Status'] == 'Menunggu':
+                        time_info = calculate_time_difference(row['Jam Mulai'])
+                        st.caption(time_info)
+                
+                with card_col3:
+                    # Status with colored indicators
+                    status = row['Status']
+                    if status == 'Sedang Live':
+                        st.success(f"🟢 {status}")
+                    elif status == 'Menunggu':
+                        st.warning(f"🟡 {status}")
+                    elif status == 'Selesai':
+                        st.info(f"🔵 {status}")
+                    else:
+                        st.error(f"🔴 {status}")
+                
+                with card_col4:
+                    # Action buttons
+                    if row['Status'] == 'Menunggu':
+                        if st.button(f"▶️ Start Now", key=f"start_{idx}"):
+                            quality = row.get('Quality', '720p')
+                            broadcast_id = row.get('Broadcast ID', None)
+                            if start_stream(row['Video'], row['Streaming Key'], row.get('Is Shorts', False), idx, quality, broadcast_id):
+                                st.session_state.streams.loc[idx, 'Status'] = 'Sedang Live'
+                                st.session_state.streams.loc[idx, 'Jam Mulai'] = format_jakarta_time(get_jakarta_time())
+                                save_persistent_streams(st.session_state.streams)
+                                st.rerun()
+                    
+                    elif row['Status'] == 'Sedang Live':
+                        if st.button(f"⏹️ Stop Stream", key=f"stop_{idx}"):
+                            if stop_stream(idx):
+                                st.rerun()
+                    
+                    # Delete button
+                    if st.button(f"🗑️ Delete", key=f"delete_{idx}"):
+                        if row['Status'] == 'Sedang Live':
+                            stop_stream(idx)
+                        st.session_state.streams = st.session_state.streams.drop(idx).reset_index(drop=True)
+                        save_persistent_streams(st.session_state.streams)
+                        st.rerun()
+                
+                st.markdown("---")
+    else:
+        st.info("📝 No streams configured. Add a stream to get started!")
+
+with col2:
+    st.header("📊 System Status")
+    
+    # Current time
+    jakarta_time = get_jakarta_time()
+    st.metric("🕐 Current Time", format_jakarta_time(jakarta_time))
+    
+    # Active streams count
+    active_streams = len(st.session_state.streams[st.session_state.streams['Status'] == 'Sedang Live'])
+    st.metric("📺 Active Streams", active_streams)
+    
+    # Waiting streams count
+    waiting_streams = len(st.session_state.streams[st.session_state.streams['Status'] == 'Menunggu'])
+    st.metric("⏳ Waiting Streams", waiting_streams)
+    
+    # System resources
+    try:
+        cpu_percent = psutil.cpu_percent(interval=1)
+        memory = psutil.virtual_memory()
+        
+        st.metric("💻 CPU Usage", f"{cpu_percent:.1f}%")
+        st.metric("🧠 Memory Usage", f"{memory.percent:.1f}%")
+    except:
+        st.info("System monitoring unavailable")
+    
+    # Auto-refresh
+    if st.button("🔄 Refresh Status"):
+        st.rerun()
+    
+    # Auto-refresh every 30 seconds
+    time.sleep(1)
+    st.rerun()
+
+# Footer
+st.markdown("---")
+st.markdown("🎬 **YouTube Live Stream Manager** - Automated streaming with Jakarta timezone support")
